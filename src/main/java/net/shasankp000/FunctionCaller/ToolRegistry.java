@@ -260,6 +260,24 @@ public class ToolRegistry {
             ),
 
             new Tool(
+                    "dropItem",
+                    """
+                    Drops the requested item from the bot's inventory into the world.
+                    Use this when the player says phrases like 'drop it sticks', 'drop oak planks', or 'drop 3 torches'.
+                    If quantity is omitted or set to 'all', drops all matching items.
+                    """,
+                    List.of(
+                            new Tool.Parameter("itemName", "Item to drop, e.g. 'stick', 'oak_planks', 'minecraft:torch'."),
+                            new Tool.Parameter("quantity", "How many items to drop, or 'all'. Defaults to 'all'.")
+                    ),
+                    Set.of("lastDropped.item", "lastDropped.quantity"),
+                    (sharedState, paramMap, result) -> {
+                        sharedState.put("lastDropped.item", paramMap.get("itemName"));
+                        sharedState.put("lastDropped.quantity", paramMap.get("quantity"));
+                    }
+            ),
+
+            new Tool(
                     "searchBlocks",
                     """
                     Efficiently searches for blocks in an expanding radius around the bot.

@@ -992,6 +992,9 @@ public class FunctionCallerV2 {
 
     public static void run(String userPrompt) {
         ollamaAPI.setRequestTimeoutSeconds(600);
+        if (tryHandleDirectDrop(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectHouseBuild(userPrompt)) {
             return;
         }
@@ -1038,6 +1041,9 @@ public class FunctionCallerV2 {
     }
 
     public static void run(String userPrompt, LLMClient client) {
+        if (tryHandleDirectDrop(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectHouseBuild(userPrompt)) {
             return;
         }
@@ -1367,6 +1373,63 @@ public class FunctionCallerV2 {
     }
 
     private record WalkRequest(String direction, int blocks, int seconds) {}
+
+    private static boolean tryHandleDirectDrop(String userInput) {
+        DropRequest dropRequest = parseDirectDropRequest(userInput);
+        if (dropRequest == null) {
+            return false;
+        }
+
+        if (botSource == null || botSource.getPlayer() == null) {
+            logger.warn("Direct drop request ignored because botSource/player is null");
+            return false;
+        }
+
+        dropItem(dropRequest.itemName(), dropRequest.quantity());
+        return true;
+    }
+
+    private static DropRequest parseDirectDropRequest(String userInput) {
+        if (userInput == null) {
+            return null;
+        }
+
+        Optional<String> clarificationAnswer = extractClarificationAnswer(userInput);
+        if (clarificationAnswer.isPresent() && userInput.toLowerCase(Locale.ROOT).contains("original:")
+                && userInput.toLowerCase(Locale.ROOT).contains("drop")) {
+            return new DropRequest(cleanupCraftItemName(clarificationAnswer.get()), -1);
+        }
+
+        Matcher matcher = Pattern.compile(
+                "(?i)\\bdrop\\b\\s+(?:it\\s+|item\\s+)?(?:(all|\\d+)\\s+)?(.+)$"
+        ).matcher(userInput);
+        if (!matcher.find()) {
+            return null;
+        }
+
+        String quantityText = matcher.group(1);
+        String rawItemName = matcher.group(2)
+                .replaceAll("(?i)\\b(?:please|now|for me)\\b", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+        String itemName = cleanupCraftItemName(rawItemName);
+        if (itemName.isBlank()) {
+            return null;
+        }
+
+        int quantity = -1;
+        if (quantityText != null && !quantityText.equalsIgnoreCase("all")) {
+            try {
+                quantity = Math.max(1, Integer.parseInt(quantityText));
+            } catch (NumberFormatException ignored) {
+                quantity = -1;
+            }
+        }
+
+        return new DropRequest(itemName, quantity);
+    }
+
+    private record DropRequest(String itemName, int quantity) {}
 
     private static boolean tryHandleDirectCraft(String userInput) {
         if (!isCraftRequest(userInput)) {
@@ -1854,6 +1917,58 @@ public class FunctionCallerV2 {
         private CraftIngredient withCount(int newCount) {
             return new CraftIngredient(label, newCount, matcher);
         }
+    }
+
+    private static void dropItem(String itemName, int quantity) {
+        MinecraftServer server = botSource.getServer();
+        server.execute(() -> {
+            try {
+                String result = dropItemOnServerThread(botSource.getPlayer(), itemName, quantity);
+                getFunctionOutput(result);
+                storeActionMemory("dropItem", Map.of(
+                        "itemName", itemName,
+                        "quantity", quantity < 0 ? "all" : String.valueOf(quantity)
+                ), result);
+                ChatUtils.sendChatMessages(botSource, result);
+            } catch (Exception e) {
+                logger.error("Failed to drop item {}", itemName, e);
+                ChatUtils.sendChatMessages(botSource, "I couldn't drop that: " + e.getMessage());
+            }
+        });
+    }
+
+    private static String dropItemOnServerThread(ServerPlayer bot, String itemName, int quantity) {
+        Optional<Item> requestedItem = resolveCraftOutputItem(itemName);
+        if (requestedItem.isEmpty()) {
+            return "I don't recognize the item '" + itemName + "'.";
+        }
+
+        Inventory inventory = bot.getInventory();
+        Item item = requestedItem.get();
+        int toDrop = quantity < 0 ? Integer.MAX_VALUE : Math.max(1, quantity);
+        int dropped = 0;
+
+        for (int slot = 0; slot < inventory.getContainerSize() && dropped < toDrop; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty() || stack.getItem() != item) {
+                continue;
+            }
+
+            int amount = Math.min(stack.getCount(), toDrop - dropped);
+            ItemStack droppedStack = stack.split(amount);
+            if (stack.isEmpty()) {
+                inventory.setItem(slot, ItemStack.EMPTY);
+            }
+            bot.drop(droppedStack, false);
+            dropped += amount;
+        }
+
+        inventory.setChanged();
+        if (dropped == 0) {
+            return "I don't have any " + itemId(item) + " to drop.";
+        }
+
+        return "Dropped " + dropped + " " + itemId(item) + ".";
     }
 
     private static void storeActionMemory(String functionName, Map<String, String> params, String result) {
@@ -2596,6 +2711,13 @@ public class FunctionCallerV2 {
                     int quantity = parseDurationSeconds(resolvePlaceholder(paramMap.getOrDefault("quantity", "1"), state));
                     logger.info("Calling method: craftItem with itemName={} quantity={}", itemName, quantity);
                     craftItem(itemName, quantity);
+                }
+                case "dropItem" -> {
+                    String itemName = resolvePlaceholder(paramMap.get("itemName"), state);
+                    String quantityValue = resolvePlaceholder(paramMap.getOrDefault("quantity", "all"), state);
+                    int quantity = "all".equalsIgnoreCase(quantityValue) ? -1 : parseDurationSeconds(quantityValue);
+                    logger.info("Calling method: dropItem with itemName={} quantity={}", itemName, quantityValue);
+                    dropItem(itemName, quantity);
                 }
                 case "getOxygenLevel" -> {
                     logger.info("Calling method: getOxygenLevel");
