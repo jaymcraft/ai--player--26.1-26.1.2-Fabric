@@ -41,14 +41,32 @@ public class ollamaClient {
     private static final Pattern THINK_BLOCK = Pattern.compile("<think>([\\s\\S]*?)</think>");
     private static final ExecutorService BOT_TASK_POOL = Executors.newCachedThreadPool();
 
+    public static void resetForBot(String newBotName) {
+        botName = newBotName;
+        isInitialized = false;
+        initialResponse = "";
+    }
+
     public static void runFromChat(String botName, String message, UUID playerUUID) {
         MinecraftServer server = AIPlayer.serverInstance;
+        if (server == null) {
+            LOGGER.error("Cannot process chat for {} because server instance is null.", botName);
+            return;
+        }
+
         ServerPlayer bot = server.getPlayerList().getPlayerByName(botName);
         if (bot == null) {
             LOGGER.error("Bot {} not online.", botName);
             return;
         }
         CommandSourceStack botSource = bot.createCommandSourceStack().withSuppressedOutput();
+
+        if (!isInitialized) {
+            LOGGER.warn("Ollama chat requested for {} before initialization completed.", botName);
+            ChatUtils.sendChatMessages(botSource, "I am still connecting to Ollama. Please try again in a moment.");
+            initializeOllamaClient();
+            return;
+        }
 
         server.execute(() -> {
             try {
@@ -176,9 +194,33 @@ public class ollamaClient {
             return;
         }
 
-        ollamaAPI.setRequestTimeoutSeconds(90);
+        // Allow long model load times for large local models (e.g., qwen3:8b)
+        ollamaAPI.setRequestTimeoutSeconds(600);
         String selectedLM = AIPlayer.CONFIG.getSelectedLanguageModel();
+
+        // If no model is selected in config, try to auto-detect an available Ollama model
+        if (selectedLM == null || selectedLM.isBlank()) {
+            LOGGER.warn("No Ollama model selected in config; attempting to auto-detect available models.");
+            try {
+                java.util.List<String> models = net.shasankp000.FilingSystem.getLanguageModels.get();
+                if (!models.isEmpty()) {
+                    selectedLM = models.get(0);
+                    AIPlayer.CONFIG.setSelectedLanguageModel(selectedLM);
+                    AIPlayer.CONFIG.save();
+                    LOGGER.info("Auto-selected Ollama model: {}", selectedLM);
+                } else {
+                    LOGGER.error("No Ollama models available to auto-select. Aborting Ollama initialization.");
+                    return;
+                }
+            } catch (Exception e) {
+                LOGGER.error("Failed to auto-detect Ollama models: {}", e.getMessage(), e);
+                return;
+            }
+        }
+
         LOGGER.info("Connecting to Ollama using model: {}", selectedLM);
+
+        final String modelToUse = selectedLM;
 
         CompletableFuture.runAsync(() -> {
             int retries = 0;
@@ -195,7 +237,7 @@ public class ollamaClient {
                     OllamaThinkingResponse response = OllamaAPIHelper.smartChat(
                             ollamaAPI,
                             host,
-                            selectedLM,
+                            modelToUse,
                             messages
                     );
 
@@ -217,8 +259,14 @@ public class ollamaClient {
                     retries++;
                     LOGGER.error("Timeout initializing Ollama (attempt {}/3)", retries);
                 } catch (Exception e) {
-                    LOGGER.error("Failed initializing Ollama: {}", e.getMessage(), e);
-                    throw new RuntimeException(e);
+                    // Don't throw — log and retry to allow large models and transient failures
+                    retries++;
+                    LOGGER.error("Failed initializing Ollama (attempt {}/3): {}", retries, e.getMessage(), e);
+                    try {
+                        Thread.sleep(2000L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             }
 

@@ -55,12 +55,12 @@ public class createFakePlayer extends ServerPlayer {
         isAShadow = shadow;
     }
 
-    public static void createFake(String username, MinecraftServer server, Vec3 pos, double yaw, double pitch,
+    public static CompletableFuture<ServerPlayer> createFake(String username, MinecraftServer server, Vec3 pos, double yaw, double pitch,
             ResourceKey<Level> dimensionId, GameType gamemode, boolean flying) {
         ServerLevel worldIn = server.getLevel(dimensionId);
         if (worldIn == null) {
             LOGGER.error("Could not spawn fake player {}: dimension {} is not loaded", username, dimensionId);
-            return;
+            return CompletableFuture.completedFuture(null);
         }
 
         GameProfile gameProfile;
@@ -75,17 +75,8 @@ public class createFakePlayer extends ServerPlayer {
 
         Map<String, String> existingBotProfile = AIPlayer.CONFIG.getBotGameProfile();
         if (gameProfile == null) {
-            if (!existingBotProfile.containsKey(username) || existingBotProfile.isEmpty()) {
+            if (existingBotProfile == null || !existingBotProfile.containsKey(username) || existingBotProfile.isEmpty()) {
                 gameProfile = new GameProfile(UUID.randomUUID(), username);
-                HashMap<String, String> botProfile = new HashMap<>();
-                botProfile.put(gameProfile.name(), gameProfile.id().toString());
-
-                try {
-                    AIPlayer.CONFIG.setBotGameProfile(botProfile);
-                    AIPlayer.CONFIG.save();
-                } catch (Exception e) {
-                    LOGGER.error("Could not save bot profile config: {}", e.getMessage());
-                }
             } else {
                 UUID existingUUID = UUID.fromString(existingBotProfile.get(username));
                 gameProfile = new GameProfile(existingUUID, username);
@@ -94,16 +85,52 @@ public class createFakePlayer extends ServerPlayer {
 
         if (useMojangAuth) {
             GameProfile finalGP = gameProfile;
-            fetchGameProfile(gameProfile.name()).thenAccept(p -> {
+            return fetchGameProfile(gameProfile.name()).thenCompose(p -> {
+                CompletableFuture<ServerPlayer> spawnFuture = new CompletableFuture<>();
                 GameProfile current = p.orElse(finalGP);
-                server.execute(() -> spawnFake(server, worldIn, current, pos, yaw, pitch, gamemode, flying, dimensionId));
+                server.execute(() -> {
+                    try {
+                        saveBotProfile(current);
+                        spawnFuture.complete(spawnFake(server, worldIn, current, pos, yaw, pitch, gamemode, flying, dimensionId));
+                    } catch (Exception e) {
+                        spawnFuture.completeExceptionally(e);
+                    }
+                });
+                return spawnFuture;
             });
-        } else {
-            spawnFake(server, worldIn, gameProfile, pos, yaw, pitch, gamemode, flying, dimensionId);
+        }
+
+        saveBotProfile(gameProfile);
+        return CompletableFuture.completedFuture(
+                spawnFake(server, worldIn, gameProfile, pos, yaw, pitch, gamemode, flying, dimensionId)
+        );
+    }
+
+    private static void saveBotProfile(GameProfile gameProfile) {
+        if (gameProfile == null || gameProfile.name() == null || gameProfile.id() == null) {
+            return;
+        }
+
+        Map<String, String> existingBotProfile = AIPlayer.CONFIG.getBotGameProfile();
+        HashMap<String, String> botProfile = new HashMap<>();
+        if (existingBotProfile != null) {
+            botProfile.putAll(existingBotProfile);
+        }
+        String previousId = botProfile.putIfAbsent(gameProfile.name(), gameProfile.id().toString());
+        if (previousId != null) {
+            return;
+        }
+
+        try {
+            AIPlayer.CONFIG.setBotGameProfile(botProfile);
+            AIPlayer.CONFIG.save();
+            LOGGER.info("Saved bot profile for {}", gameProfile.name());
+        } catch (Exception e) {
+            LOGGER.error("Could not save bot profile config: {}", e.getMessage());
         }
     }
 
-    private static void spawnFake(MinecraftServer server, ServerLevel worldIn, GameProfile gameprofile, Vec3 pos,
+    private static ServerPlayer spawnFake(MinecraftServer server, ServerLevel worldIn, GameProfile gameprofile, Vec3 pos,
             double yaw, double pitch, GameType gamemode, boolean flying, ResourceKey<Level> dimensionId) {
         createFakePlayer instance = new createFakePlayer(server, worldIn, gameprofile,
                 ClientInformation.createDefault(), false);
@@ -118,11 +145,20 @@ public class createFakePlayer extends ServerPlayer {
                 new ClientboundRotateHeadPacket(instance, (byte) (instance.yHeadRot * 256 / 360)), dimensionId);
         instance.entityData.set(DATA_PLAYER_MODE_CUSTOMISATION, (byte) 0x7f);
         instance.getAbilities().flying = flying;
+        return instance;
     }
 
     private static final class FakeClientConnection extends net.minecraft.network.Connection {
         private FakeClientConnection(PacketFlow receiving) {
             super(receiving);
+            try {
+                io.netty.channel.embedded.EmbeddedChannel embedded = new io.netty.channel.embedded.EmbeddedChannel();
+                java.lang.reflect.Field chField = net.minecraft.network.Connection.class.getDeclaredField("channel");
+                chField.setAccessible(true);
+                chField.set(this, embedded);
+            } catch (Exception e) {
+                createFakePlayer.LOGGER.warn("Failed to setup embedded channel for FakeClientConnection", e);
+            }
         }
 
         @Override
@@ -144,6 +180,7 @@ public class createFakePlayer extends ServerPlayer {
         @Override
         public void send(Packet<?> packet, ChannelFutureListener channelFutureListener, boolean flush) {
         }
+
 
         @Override
         public boolean isConnected() {

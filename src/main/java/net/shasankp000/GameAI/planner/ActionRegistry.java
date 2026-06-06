@@ -247,25 +247,25 @@ public class ActionRegistry {
         // Return goal-specific defaults instead of ALL actions
         return switch (goalId) {
             case 1 -> // MINE
-                new String[]{"mineBlock", "look", "detectBlocks", "getInventory"};
+                new String[]{"mineBlock", "look", "detectBlocks"};
             case 2 -> // BUILD
-                new String[]{"placeBlock", "look", "navigateTo", "getInventory"};
+                new String[]{"placeBlock", "look", "goTo"};
             case 3 -> // CRAFT
-                new String[]{"craft", "getInventory", "detectBlocks"};
+                new String[]{"look", "detectBlocks"};
             case 4 -> // NAVIGATE
-                new String[]{"navigateTo", "goTo", "look"};
+                new String[]{"goTo", "walk", "look"};
             case 5 -> // COMBAT
-                new String[]{"attack", "shoot", "defend", "getHealthLevel"};
+                new String[]{"attack", "hit", "getHealthLevel"};
             case 6 -> // GATHER (most common)
-                new String[]{"mineBlock", "detectBlocks", "look", "navigateTo", "getInventory"};
+                new String[]{"mineBlock", "detectBlocks", "look", "goTo"};
             case 7 -> // EXPLORE
-                new String[]{"navigateTo", "look", "detectBlocks", "webSearch"};
+                new String[]{"goTo", "walk", "look", "detectBlocks", "webSearch"};
             case 8 -> // FARM
-                new String[]{"placeBlock", "mineBlock", "look", "navigateTo"};
+                new String[]{"placeBlock", "mineBlock", "look", "goTo"};
             case 9 -> // TRADE
-                new String[]{"navigateTo", "look", "getInventory"};
+                new String[]{"goTo", "walk", "look"};
             default -> // Unknown goal - minimal set
-                new String[]{"look", "getInventory", "getHealthLevel"};
+                new String[]{"look", "walk", "getHealthLevel"};
         };
     }
 
@@ -291,4 +291,3 @@ public class ActionRegistry {
         return funcName;
     }
 }
-

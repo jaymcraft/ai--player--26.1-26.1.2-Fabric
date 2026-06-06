@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URI;
+import java.time.Duration;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
@@ -18,6 +19,9 @@ import java.net.http.HttpResponse.BodyHandlers;
  * This allows using alternative providers like OpenRouter that follow the OpenAI API standard.
  */
 public class GenericOpenAIClient implements LLMClient {
+    private static final int MAX_OUTPUT_TOKENS = 1024;
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(15);
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(45);
     private final String apiKey;
     private final String modelName;
     private final String baseUrl;
@@ -31,9 +35,27 @@ public class GenericOpenAIClient implements LLMClient {
         if (baseUrl == null || baseUrl.trim().isEmpty()) {
             throw new IllegalArgumentException("Base URL cannot be null or empty");
         }
-        String trimmedUrl = baseUrl.trim();
-        this.baseUrl = trimmedUrl.endsWith("/") ? trimmedUrl : trimmedUrl + "/";
-        this.client = HttpClient.newHttpClient();
+        this.baseUrl = normalizeApiBaseUrl(baseUrl);
+        this.client = HttpClient.newBuilder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .build();
+    }
+
+    private static String normalizeApiBaseUrl(String rawBaseUrl) {
+        String normalized = rawBaseUrl.trim().replaceAll("/+$", "");
+        if (normalized.endsWith("/chat/completions")) {
+            normalized = normalized.substring(0, normalized.length() - "/chat/completions".length());
+        } else if (normalized.endsWith("/completions")) {
+            normalized = normalized.substring(0, normalized.length() - "/completions".length());
+        } else if (normalized.endsWith("/chat")) {
+            normalized = normalized.substring(0, normalized.length() - "/chat".length());
+        }
+
+        if (normalized.equals("https://openrouter.ai")) {
+            normalized = "https://openrouter.ai/api/v1";
+        }
+
+        return normalized.endsWith("/") ? normalized : normalized + "/";
     }
 
     @Override
@@ -58,16 +80,18 @@ public class GenericOpenAIClient implements LLMClient {
             messages.add(userMessage);
 
             requestBody.add("messages", messages);
-            requestBody.addProperty("max_tokens", 150);
+            requestBody.addProperty("max_tokens", MAX_OUTPUT_TOKENS);
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "chat/completions"))
                     .header("Authorization", "Bearer " + apiKey)
                     .header("Content-Type", "application/json")
+                    .timeout(REQUEST_TIMEOUT)
                     .POST(BodyPublishers.ofString(requestBody.toString()))
                     .build();
 
             HttpResponse<String> response = client.send(request, BodyHandlers.ofString());
+            LOGGER.info("Custom chat completion response: HTTP {} from {}", response.statusCode(), request.uri());
 
             // Handle HTTP error codes
             if (response.statusCode() != 200) {
@@ -101,11 +125,14 @@ public class GenericOpenAIClient implements LLMClient {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "models"))
                     .header("Authorization", "Bearer " + apiKey)
+                    .timeout(REQUEST_TIMEOUT)
                     .GET()
                     .build();
             HttpResponse<String> response = client.send(request, BodyHandlers.ofString());
+            LOGGER.info("Custom models response: HTTP {} from {}", response.statusCode(), request.uri());
             return response.statusCode() == 200;
         } catch (Exception e) {
+            LOGGER.error("Custom API reachability check failed: {}", e.getMessage(), e);
             return false;
         }
     }

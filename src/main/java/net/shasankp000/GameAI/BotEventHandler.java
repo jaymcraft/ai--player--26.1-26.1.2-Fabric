@@ -154,7 +154,7 @@ public class BotEventHandler {
 
             System.out.println("Distance from danger zone: " + DangerZoneDetector.detectDangerZone(bot, 10, 10 , 10) + " blocks");
 
-            List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, 32); // Increased detection range for better awareness
+            List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, AutoFaceEntity.HOSTILE_DETECTION_RANGE);
             List<Entity> hostileEntities = nearbyEntities.stream()
                     .filter(entity -> {
                         // Include HostileEntity mobs
@@ -553,7 +553,7 @@ public class BotEventHandler {
 
             else {
                 // Detect nearby hostile entities (including hostile players)
-                List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, 32); // Increased detection range for better awareness
+                List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, AutoFaceEntity.HOSTILE_DETECTION_RANGE);
                 List<Entity> hostileEntities = nearbyEntities.stream()
                         .filter(entity -> {
                             // Include HostileEntity mobs
@@ -620,6 +620,12 @@ public class BotEventHandler {
     }
 
     private static void executeAction(StateActions.Action chosenAction, CommandSourceStack botSource) {
+        MinecraftServer actionServer = botSource.getServer();
+        if (actionServer != null && !actionServer.isSameThread()) {
+            actionServer.execute(() -> executeAction(chosenAction, botSource));
+            return;
+        }
+
         switch (chosenAction) {
             case MOVE_FORWARD -> performAction("moveForward", botSource);
             case MOVE_BACKWARD -> performAction("moveBackward", botSource);
@@ -664,7 +670,7 @@ public class BotEventHandler {
                 isBlockItem.checkBlockItem(selectedItemStack)
         );
 
-        List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, 32);
+        List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, AutoFaceEntity.HOSTILE_DETECTION_RANGE);
 
         List<EntityDetails> nearbyEntitiesList = new ArrayList<>();
 
@@ -919,7 +925,7 @@ public class BotEventHandler {
                 startAction(botName, "EVADE");
 
                 // Find nearest hostile entity to evade from
-                List<Entity> nearbyHostiles = AutoFaceEntity.detectNearbyEntities(bot, 20.0).stream()
+                List<Entity> nearbyHostiles = AutoFaceEntity.detectNearbyEntities(bot, AutoFaceEntity.HOSTILE_DETECTION_RANGE).stream()
                     .filter(e -> e instanceof Monster || e instanceof Slime)
                     .toList();
 
@@ -1760,4 +1766,3 @@ public class BotEventHandler {
     }
 
 }
-

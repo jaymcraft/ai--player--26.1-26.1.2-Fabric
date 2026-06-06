@@ -14,6 +14,7 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 
 public class GrokClient implements LLMClient {
+    private static final int MAX_OUTPUT_TOKENS = 1024;
     private final String apiKey;
     private final String modelName;
     private final HttpClient client;
@@ -46,7 +47,7 @@ public class GrokClient implements LLMClient {
             messages.add(userMessage);
 
             requestBody.add("messages", messages);
-            requestBody.addProperty("max_tokens", 150);
+            requestBody.addProperty("max_tokens", MAX_OUTPUT_TOKENS);
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create("https://api.x.ai/v1/chat/completions"))

@@ -37,7 +37,8 @@ import java.util.concurrent.TimeUnit;
 public class AutoFaceEntity {
 
     public static final Logger LOGGER = LoggerFactory.getLogger("AutoFaceEntity");
-    private static final double BOUNDING_BOX_SIZE = 32.0; // Detection range in blocks (increased for better combat awareness)
+    public static final double HOSTILE_DETECTION_RANGE = 8.0;
+    private static final double BOUNDING_BOX_SIZE = HOSTILE_DETECTION_RANGE;
     private static final int INTERVAL_SECONDS = 1; // Interval in seconds to check for nearby entities (for entity detection)
     private static final int PROJECTILE_CHECK_INTERVAL_MS = 50; // Check projectiles every 50ms (1 game tick) - fast enough for arrows
     private static final ExecutorService executor3 = Executors.newSingleThreadExecutor();

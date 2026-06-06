@@ -1,7 +1,9 @@
 package net.shasankp000.ChatUtils;
 
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
 import net.minecraft.server.MinecraftServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,8 +19,15 @@ public class ChatUtils {
     // Configuration
     private static final int MAX_CHAT_LENGTH = 100;
     private static final long MESSAGE_DELAY_MS = 2500L;
-    private static final List<String> COLOR_CODES = Arrays.asList(
-            "§9", "§b", "§d", "§e", "§6", "§5", "§c", "§7"
+    private static final List<ChatFormatting> CHAT_COLORS = Arrays.asList(
+            ChatFormatting.BLUE,
+            ChatFormatting.AQUA,
+            ChatFormatting.LIGHT_PURPLE,
+            ChatFormatting.YELLOW,
+            ChatFormatting.GOLD,
+            ChatFormatting.DARK_PURPLE,
+            ChatFormatting.RED,
+            ChatFormatting.GRAY
     );
 
     private static final Random random = new Random();
@@ -102,14 +111,17 @@ public class ChatUtils {
                 formattedMessage = formattedMessage.replace(sourceName + ": ", "");
             }
 
-            // Now use the formattedMessage to build the final colored message.
-            String coloredMessage = getRandomColorCode() + formattedMessage;
+            ChatFormatting color = getRandomColor();
+            Component chatComponent = Component.literal("<" + sourceName + "> ")
+                    .append(Component.literal(formattedMessage).withStyle(Style.EMPTY.withColor(color)));
 
 
-            LOGGER.info("Broadcasting message part {}: '{}' from source: {}", partIndex, coloredMessage, sourceName);
+            LOGGER.info("Broadcasting message part {}: '{}' from source: {}", partIndex, formattedMessage, sourceName);
 
-            // Using the command manager to send the message
-            server.getCommands().performPrefixedCommand(source, "/say " + coloredMessage);
+            server.getPlayerList().broadcastSystemMessage(
+                    chatComponent,
+                    false
+            );
 
             LOGGER.debug("Successfully broadcasted message part {}", partIndex);
 
@@ -141,7 +153,7 @@ public class ChatUtils {
         server.execute(() -> {
             try {
                 Component textComponent = Component.literal("§7" + message); // Gray color for system messages
-                server.getCommands().performPrefixedCommand(source.withSuppressedOutput(), "/say " + textComponent.getString());
+                server.getPlayerList().broadcastSystemMessage(textComponent, false);
                 LOGGER.debug("Successfully sent system message");
             } catch (Exception e) {
                 LOGGER.error("Failed to send system message: {}", e.getMessage(), e);
@@ -225,7 +237,11 @@ public class ChatUtils {
      * Get a random color code for message formatting.
      */
     public static String getRandomColorCode() {
-        return COLOR_CODES.get(random.nextInt(COLOR_CODES.size()));
+        return getRandomColor().toString();
+    }
+
+    public static ChatFormatting getRandomColor() {
+        return CHAT_COLORS.get(random.nextInt(CHAT_COLORS.size()));
     }
 
     /**

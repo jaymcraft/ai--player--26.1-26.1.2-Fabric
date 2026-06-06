@@ -89,6 +89,44 @@ public class ToolRegistry {
                     }
             ),
 
+            new Tool(
+                    "walk",
+                    """
+                    Makes the bot walk forward for a short duration, then stops movement.
+                    """,
+                    List.of(
+                            new Tool.Parameter("seconds", "How many seconds to walk. Defaults to 1."),
+                            new Tool.Parameter("direction", "Direction to walk. Valid: 'forward' or 'backward'. Defaults to 'forward'.")
+                    ),
+                    Set.of("bot.walking"),
+                    (sharedState, paramMap, result) -> sharedState.put("bot.walking", false)
+            ),
+
+            new Tool(
+                    "hit",
+                    """
+                    Makes the bot swing or attack once using the currently held item.
+                    Alias for simple melee interaction.
+                    """,
+                    List.of(
+                            new Tool.Parameter("None", "No parameters needed.")
+                    ),
+                    Set.of("lastAttack.status"),
+                    (sharedState, paramMap, result) -> sharedState.put("lastAttack.status", result)
+            ),
+
+            new Tool(
+                    "attack",
+                    """
+                    Makes the bot attack the current target or swing once using the currently held item.
+                    """,
+                    List.of(
+                            new Tool.Parameter("None", "No parameters needed.")
+                    ),
+                    Set.of("lastAttack.status"),
+                    (sharedState, paramMap, result) -> sharedState.put("lastAttack.status", result)
+            ),
+
 
             new Tool(
                     "mineBlock",

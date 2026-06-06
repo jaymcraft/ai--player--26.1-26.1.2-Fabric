@@ -90,32 +90,35 @@ public class SQLiteDB {
         }
     }
 
-    public static List<Memory> findRelevantMemories(List<Double> queryEmbedding, String typeFilter, int topK) {
-        logger.info("Query embedding size: {}", queryEmbedding.size());
+    public static void storeMemory(String type, String prompt, String response) {
+        storeMemory(type, prompt, response, List.of());
+    }
 
+    public static List<Memory> fetchRecentMemories(List<String> types, int limit) {
         List<Memory> results = new ArrayList<>();
+        if (types == null || types.isEmpty() || limit <= 0) {
+            return results;
+        }
+
+        String placeholders = String.join(",", types.stream().map(type -> "?").toList());
         String sql = """
-                    SELECT id, type, timestamp, prompt, response,
-                           1 - cosine_distance(embedding, ?) AS similarity
+                    SELECT id, type, timestamp, prompt, response, 0.0 AS similarity
                     FROM memories
-                    WHERE type = ?
-                    ORDER BY similarity DESC
+                    WHERE type IN (%s)
+                    ORDER BY id DESC
                     LIMIT ?;
-                """;
+                """.formatted(placeholders);
 
-        SQLiteConfig config = new SQLiteConfig();
+        try (Connection conn = DriverManager.getConnection(DB_URL);
+                PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
-        try (Connection conn = DriverManager.getConnection(DB_URL, config.toProperties())) {
+            int index = 1;
+            for (String type : types) {
+                pstmt.setString(index++, type);
+            }
+            pstmt.setInt(index, limit);
 
-            // Always register the fallback cosine_distance UDF
-            VectorExtensionHelper.registerCosineDistanceIfNeeded(conn);
-
-            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-                pstmt.setString(1, vectorToLiteral(queryEmbedding));
-                pstmt.setString(2, typeFilter);
-                pstmt.setInt(3, topK);
-
-                ResultSet rs = pstmt.executeQuery();
+            try (ResultSet rs = pstmt.executeQuery()) {
                 while (rs.next()) {
                     results.add(new Memory(
                             rs.getInt("id"),
@@ -123,7 +126,45 @@ public class SQLiteDB {
                             rs.getString("timestamp"),
                             rs.getString("prompt"),
                             rs.getString("response"),
-                            rs.getDouble("similarity")));
+                            0.0));
+                }
+            }
+        } catch (SQLException e) {
+            logger.error("❌ Failed to fetch recent memories: SQLState={}, ErrorCode={}, Message={}",
+                    e.getSQLState(), e.getErrorCode(), e.getMessage());
+        }
+
+        return results;
+    }
+
+    public static List<Memory> findRelevantMemories(List<Double> queryEmbedding, String typeFilter, int topK) {
+        logger.info("Query embedding size: {}", queryEmbedding.size());
+
+        List<Memory> results = new ArrayList<>();
+        String sql = """
+                    SELECT id, type, timestamp, prompt, response, embedding
+                    FROM memories
+                    WHERE type = ?
+                """;
+
+        SQLiteConfig config = new SQLiteConfig();
+
+        try (Connection conn = DriverManager.getConnection(DB_URL, config.toProperties())) {
+
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                pstmt.setString(1, typeFilter);
+
+                ResultSet rs = pstmt.executeQuery();
+                while (rs.next()) {
+                    List<Double> storedEmbedding = vectorFromLiteral(rs.getString("embedding"));
+                    double similarity = cosineSimilarity(queryEmbedding, storedEmbedding);
+                    results.add(new Memory(
+                            rs.getInt("id"),
+                            rs.getString("type"),
+                            rs.getString("timestamp"),
+                            rs.getString("prompt"),
+                            rs.getString("response"),
+                            similarity));
                 }
             }
 
@@ -132,6 +173,10 @@ public class SQLiteDB {
                     e.getSQLState(), e.getErrorCode(), e.getMessage());
         }
 
+        results.sort((a, b) -> Double.compare(b.similarity(), a.similarity()));
+        if (topK > 0 && results.size() > topK) {
+            return new ArrayList<>(results.subList(0, topK));
+        }
         return results;
     }
 
@@ -167,6 +212,10 @@ public class SQLiteDB {
     }
 
     private static String vectorToLiteral(List<Double> vec) {
+        if (vec == null || vec.isEmpty()) {
+            return "[]";
+        }
+
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < vec.size(); i++) {
             sb.append(vec.get(i));
@@ -175,6 +224,54 @@ public class SQLiteDB {
         }
         sb.append("]");
         return sb.toString();
+    }
+
+    private static List<Double> vectorFromLiteral(String literal) {
+        List<Double> vector = new ArrayList<>();
+        if (literal == null || literal.isBlank()) {
+            return vector;
+        }
+
+        String trimmed = literal.trim();
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        if (trimmed.isBlank()) {
+            return vector;
+        }
+
+        for (String part : trimmed.split(",")) {
+            try {
+                vector.add(Double.parseDouble(part.trim()));
+            } catch (NumberFormatException e) {
+                logger.warn("Skipping invalid vector value '{}'", part);
+            }
+        }
+        return vector;
+    }
+
+    private static double cosineSimilarity(List<Double> a, List<Double> b) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) {
+            return 0.0;
+        }
+
+        int size = Math.min(a.size(), b.size());
+        double dot = 0.0;
+        double normA = 0.0;
+        double normB = 0.0;
+
+        for (int i = 0; i < size; i++) {
+            double valueA = a.get(i);
+            double valueB = b.get(i);
+            dot += valueA * valueB;
+            normA += valueA * valueA;
+            normB += valueB * valueB;
+        }
+
+        if (normA == 0.0 || normB == 0.0) {
+            return 0.0;
+        }
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
     public record Memory(

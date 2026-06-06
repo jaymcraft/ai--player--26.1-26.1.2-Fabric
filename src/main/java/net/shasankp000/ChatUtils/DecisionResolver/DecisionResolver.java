@@ -76,7 +76,7 @@ public class DecisionResolver {
         String answer = "";
 
         switch (llmProvider) {
-            case "openai", "claude", "grok", "gemini":
+            case "openai", "gpt", "claude", "anthropic", "grok", "xAI", "xai", "gemini", "google", "custom":
                 LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
                 if (llmClient!=null) {
                     if (llmClient.isReachable()) {

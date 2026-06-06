@@ -33,6 +33,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.shasankp000.AIPlayer;
 
 import net.shasankp000.ChatUtils.ChatContextManager;
@@ -290,18 +291,7 @@ public class FunctionCallerV2 {
                 } else if (jsonObject.has("functionName")) {
                     // Single function call
                     String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.getAsJsonArray("parameters");
-                    Map<String, String> paramMap = new HashMap<>();
-
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = resolvePlaceholder(
-                            paramObj.get("parameterValue").getAsString(),
-                            sharedState
-                        );
-                        paramMap.put(paramName, paramValue);
-                    }
+                    Map<String, String> paramMap = parseParameterMap(jsonObject.get("parameters"), sharedState);
 
                     logger.info("[planner] ✓ LLM generated single function: {} with {}", fnName, paramMap);
                     callFunction(fnName, paramMap, sharedState).join();
@@ -476,6 +466,59 @@ public class FunctionCallerV2 {
             getFunctionOutput("Now facing cardinal direction: " + Objects.requireNonNull(botSource.getPlayer()).getNearestViewDirection().getName() + " which is in " + Objects.requireNonNull(botSource.getPlayer()).getNearestViewDirection().getAxis().getSerializedName() + " axis.");
         }
 
+        /** walk: move in a direction for a short duration **/
+        private static void walk(int seconds) {
+            walk(seconds, "forward");
+        }
+
+        private static void walk(int seconds, String direction) {
+            String movementDirection = normalizeWalkDirection(direction);
+            System.out.println("Walking " + movementDirection + " for: " + seconds + " seconds");
+            if (botSource == null || botSource.getPlayer() == null) {
+                getFunctionOutput("Bot not found.");
+                return;
+            }
+
+            MinecraftServer server = botSource.getServer();
+            String botName = botSource.getPlayer().getName().getString();
+            int clampedSeconds = Math.max(1, Math.min(seconds, 30));
+
+            logger.info("Executing walk command for {} moving {}", botName, movementDirection);
+            server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " move " + movementDirection);
+            AutoFaceEntity.isBotMoving = true;
+            AutoFaceEntity.setBotExecutingTask(true);
+
+            executor.submit(() -> {
+                try {
+                    Thread.sleep(clampedSeconds * 1000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                server.execute(() -> {
+                    logger.info("Executing walk stop command for {}", botName);
+                    server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stop");
+                    AutoFaceEntity.isBotMoving = false;
+                    AutoFaceEntity.setBotExecutingTask(false);
+                });
+            });
+
+            getFunctionOutput("Walking " + movementDirection + " for " + clampedSeconds + " seconds.");
+        }
+
+        /** hit: swing/attack once **/
+        private static void hit() {
+            System.out.println("Hitting with current item");
+            if (botSource == null || botSource.getPlayer() == null) {
+                getFunctionOutput("Bot not found.");
+                return;
+            }
+
+            MinecraftServer server = botSource.getServer();
+            String botName = botSource.getTextName();
+            server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack");
+            getFunctionOutput("Attack executed.");
+        }
+
         /** mineBlock: break block **/
         private static void mineBlock(int targetX, int targetY, int targetZ) {
             System.out.println("Mining block at: " + targetX + ", " + targetY + ", " + targetZ);
@@ -613,13 +656,16 @@ public class FunctionCallerV2 {
 
     // This code right here is pure EUREKA moment.
     private static String buildPrompt(String toolString) {
+        String recentMemory = buildRecentMemoryContext();
         return """
             You are a first-principles reasoning **function-caller AI agent** for a Minecraft bot.
             
             You will be provided with additional context information of the minecraft bot you are controlling. Use that information well to carefully plan your approach.
+            You also have recent chat/action memory. Use it to maintain continuity, avoid repeating failed actions, and understand follow-up requests.
 
             Your role is to analyze player prompts carefully and decide which tool or sequence of tools best accomplishes the task.
             You must output your decision strictly as JSON, following the required schema.
+            Return a complete JSON object in one response. Never stop after an opening brace.
             
             ---
             
@@ -708,9 +754,12 @@ public class FunctionCallerV2 {
             If you only need to use one tool, output in this JSON format.
             
             {
-              "functionName": "searchBlock",
+              "functionName": "searchBlocks",
               "parameters": [
-                { "parameterName": "direction", "parameterValue": "front" }
+                { "parameterName": "blockType", "parameterValue": "minecraft:oak_log" },
+                { "parameterName": "initialRadius", "parameterValue": "10" },
+                { "parameterName": "maxRadius", "parameterValue": "100" },
+                { "parameterName": "radiusIncrement", "parameterValue": "20" }
               ]
             }
             
@@ -719,9 +768,12 @@ public class FunctionCallerV2 {
             {
               "pipeline": [
                 {
-                  "functionName": "searchBlock",
+                  "functionName": "searchBlocks",
                   "parameters": [
-                    { "parameterName": "direction", "parameterValue": "front" }
+                    { "parameterName": "blockType", "parameterValue": "minecraft:oak_log" },
+                    { "parameterName": "initialRadius", "parameterValue": "10" },
+                    { "parameterName": "maxRadius", "parameterValue": "100" },
+                    { "parameterName": "radiusIncrement", "parameterValue": "20" }
                   ]
                 },
                 {
@@ -791,7 +843,26 @@ public class FunctionCallerV2 {
                 
                 And the correct placeholders to use per tool: \n
                 
-                """ + functionStateKeyMap + "\n Do remember to add a placeholder symbol: $ in front of each parameter name when designing the pipeline json.";
+                """ + functionStateKeyMap + "\n Do remember to add a placeholder symbol: $ in front of each parameter name when designing the pipeline json."
+                + "\n\nRecent memory:\n" + recentMemory;
+    }
+
+    private static String buildRecentMemoryContext() {
+        List<SQLiteDB.Memory> memories = SQLiteDB.fetchRecentMemories(List.of("chat", "action"), 10);
+        if (memories.isEmpty()) {
+            return "No recent chat or action memory.";
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (SQLiteDB.Memory memory : memories) {
+            builder.append("- [").append(memory.type()).append("] ");
+            builder.append(memory.prompt());
+            if (memory.response() != null && !memory.response().isBlank()) {
+                builder.append(" -> ").append(memory.response());
+            }
+            builder.append("\n");
+        }
+        return builder.toString().trim();
     }
 
     private static String generatePromptContext(String userPrompt) {
@@ -911,6 +982,10 @@ public class FunctionCallerV2 {
 
     public static void run(String userPrompt) {
         ollamaAPI.setRequestTimeoutSeconds(600);
+        if (tryHandleDirectWalk(userPrompt)) {
+            return;
+        }
+
         String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
         String response;
         State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
@@ -947,6 +1022,10 @@ public class FunctionCallerV2 {
     }
 
     public static void run(String userPrompt, LLMClient client) {
+        if (tryHandleDirectWalk(userPrompt)) {
+            return;
+        }
+
         String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
         String response;
         State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
@@ -989,7 +1068,7 @@ public class FunctionCallerV2 {
             if (isValidJson(candidate)) return candidate;
         }
         logger.error("❌ Could not extract valid JSON from response:\n{}", response);
-        return "{}";
+        return "";
     }
 
     private static boolean isValidJson(String json) {
@@ -1011,9 +1090,13 @@ public class FunctionCallerV2 {
 
     private static void executeFunction(String userInput, String response) {
         String executionDateTime = getCurrentDateandTime();
-        try {
-            executor.submit(() -> {
+        executor.submit(() -> {
+            try {
+                if (response == null || response.isBlank()) {
+                    throw new IllegalStateException("LLM returned malformed or incomplete JSON.");
+                }
                 String cleanedResponse = cleanJsonString(response);
+                cleanedResponse = wrapBareParameterArray(userInput, cleanedResponse);
                 logger.info("Cleaned JSON Response: {}", cleanedResponse);
                 JsonReader reader = new JsonReader(new StringReader(cleanedResponse));
                 reader.setLenient(true);
@@ -1025,17 +1108,9 @@ public class FunctionCallerV2 {
                 } else if (jsonObject.has("functionName")) {
                     AutoFaceEntity.setBotExecutingTask(true);
                     String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.get("parameters").getAsJsonArray();
-                    Map<String, String> paramMap = new ConcurrentHashMap<>();
-                    StringBuilder params = new StringBuilder();
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = paramObj.get("parameterValue").getAsString();
-                        paramValue = resolvePlaceholder(paramValue, sharedState);
-                        params.append(paramName).append("=").append(paramValue).append(", ");
-                        paramMap.put(paramName, paramValue);
-                    }
+                    Map<String, String> paramMap = new ConcurrentHashMap<>(
+                            parseParameterMap(jsonObject.get("parameters"), sharedState)
+                    );
                     logger.info("Executing: {} with {}", fnName, paramMap);
                     callFunction(fnName, paramMap, sharedState).join();
                 } else if (jsonObject.has("clarification")) {
@@ -1049,17 +1124,22 @@ public class FunctionCallerV2 {
                     throw new IllegalStateException("Response must have either functionName or pipeline.");
                 }
                 // getFunctionResultAndSave(userInput, executionDateTime);
-            });
-        } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
-            logger.error("Error processing JSON response: {}", e.getMessage(), e);
-        }
+            } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
+                logger.error("Error processing JSON response: {}", e.getMessage(), e);
+                ChatUtils.sendChatMessages(botSource, "I couldn't understand the action response from the language model. Please try that action again.");
+            }
+        });
     }
 
     private static void executeFunction(String userInput, String response, LLMClient client) {
         String executionDateTime = getCurrentDateandTime();
-        try {
-            executor.submit(() -> {
+        executor.submit(() -> {
+            try {
+                if (response == null || response.isBlank()) {
+                    throw new IllegalStateException("LLM returned malformed or incomplete JSON.");
+                }
                 String cleanedResponse = cleanJsonString(response);
+                cleanedResponse = wrapBareParameterArray(userInput, cleanedResponse);
                 logger.info("Cleaned JSON Response: {}", cleanedResponse);
                 JsonReader reader = new JsonReader(new StringReader(cleanedResponse));
                 reader.setLenient(true);
@@ -1071,17 +1151,9 @@ public class FunctionCallerV2 {
                 } else if (jsonObject.has("functionName")) {
                     AutoFaceEntity.setBotExecutingTask(true);
                     String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.get("parameters").getAsJsonArray();
-                    Map<String, String> paramMap = new ConcurrentHashMap<>();
-                    StringBuilder params = new StringBuilder();
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = paramObj.get("parameterValue").getAsString();
-                        paramValue = resolvePlaceholder(paramValue, sharedState);
-                        params.append(paramName).append("=").append(paramValue).append(", ");
-                        paramMap.put(paramName, paramValue);
-                    }
+                    Map<String, String> paramMap = new ConcurrentHashMap<>(
+                            parseParameterMap(jsonObject.get("parameters"), sharedState)
+                    );
                     logger.info("Executing: {} with {}", fnName, paramMap);
                     callFunction(fnName, paramMap, sharedState).join();
                 } else if (jsonObject.has("clarification")) {
@@ -1094,9 +1166,195 @@ public class FunctionCallerV2 {
                     throw new IllegalStateException("Response must have either functionName or pipeline.");
                 }
                 // getFunctionResultAndSave(userInput, executionDateTime);
+            } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
+                logger.error("Error processing JSON response: {}", e.getMessage(), e);
+                ChatUtils.sendChatMessages(botSource, "I couldn't understand the action response from the language model. Please try that action again.");
+            }
+        });
+    }
+
+    private static String wrapBareParameterArray(String userInput, String cleanedResponse) {
+        if (cleanedResponse == null || !cleanedResponse.trim().startsWith("[")) {
+            return cleanedResponse;
+        }
+
+        String inferredFunction = inferFunctionFromUserInput(userInput);
+        if (inferredFunction == null) {
+            return cleanedResponse;
+        }
+
+        JsonElement parsed = JsonParser.parseString(cleanedResponse);
+        if (!parsed.isJsonArray()) {
+            return cleanedResponse;
+        }
+
+        JsonObject wrapped = new JsonObject();
+        wrapped.addProperty("functionName", inferredFunction);
+        wrapped.add("parameters", parsed.getAsJsonArray());
+        logger.warn("Wrapped bare parameter array as function '{}': {}", inferredFunction, wrapped);
+        return wrapped.toString();
+    }
+
+    private static String inferFunctionFromUserInput(String userInput) {
+        if (userInput == null) {
+            return null;
+        }
+
+        String normalized = userInput.toLowerCase(Locale.ROOT);
+        if (normalized.contains("walk") || normalized.contains("move forward") || normalized.contains("forward")) {
+            return "walk";
+        }
+        if (normalized.contains("hit") || normalized.contains("attack")) {
+            return "hit";
+        }
+        return null;
+    }
+
+    private static boolean tryHandleDirectWalk(String userInput) {
+        WalkRequest walkRequest = parseDirectWalkRequest(userInput);
+        if (walkRequest == null) {
+            return false;
+        }
+
+        if (botSource == null || botSource.getPlayer() == null) {
+            logger.warn("Direct walk request ignored because botSource/player is null");
+            return false;
+        }
+
+        logger.info("Direct walk request detected: {} blocks {} -> {} seconds",
+                walkRequest.blocks, walkRequest.direction, walkRequest.seconds);
+        startRelativeWalk(walkRequest);
+        return true;
+    }
+
+    private static void startRelativeWalk(WalkRequest walkRequest) {
+        MinecraftServer server = botSource.getServer();
+        ServerPlayer bot = botSource.getPlayer();
+        String botName = bot.getName().getString();
+        int ticks = Math.max(1, walkRequest.seconds * 20);
+        int multiplier = "backward".equals(walkRequest.direction) ? -1 : 1;
+        Vec3 start = bot.position();
+        Vec3 look = bot.getViewVector(1.0F);
+        Vec3 horizontal = new Vec3(look.x, 0.0, look.z);
+        if (horizontal.lengthSqr() < 1.0E-6) {
+            Direction facing = bot.getDirection();
+            horizontal = new Vec3(facing.getStepX(), 0.0, facing.getStepZ());
+        }
+        Vec3 offset = horizontal.normalize().scale(walkRequest.blocks * multiplier);
+        Vec3 target = start.add(offset);
+
+        AutoFaceEntity.isBotMoving = true;
+        AutoFaceEntity.setBotExecutingTask(true);
+
+        executor.submit(() -> {
+            logger.info("Executing precise direct walk for {} from {} to {} over {} ticks",
+                    botName, start, target, ticks);
+            for (int tick = 0; tick < ticks; tick++) {
+                double progress = (tick + 1) / (double) ticks;
+                Vec3 next = start.lerp(target, progress);
+                server.execute(() -> bot.teleportTo(
+                        bot.level(),
+                        next.x,
+                        next.y,
+                        next.z,
+                        Set.of(),
+                        bot.getYRot(),
+                        bot.getXRot(),
+                        false
+                ));
+
+                try {
+                    Thread.sleep(50L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            server.execute(() -> {
+                bot.teleportTo(
+                        bot.level(),
+                        target.x,
+                        target.y,
+                        target.z,
+                        Set.of(),
+                        bot.getYRot(),
+                        bot.getXRot(),
+                        false
+                );
+                AutoFaceEntity.isBotMoving = false;
+                AutoFaceEntity.setBotExecutingTask(false);
+                String result = "Walked " + walkRequest.blocks + " blocks " + walkRequest.direction + ".";
+                getFunctionOutput(result);
+                storeActionMemory("directWalk", Map.of(
+                        "blocks", String.valueOf(walkRequest.blocks),
+                        "direction", walkRequest.direction,
+                        "seconds", String.valueOf(walkRequest.seconds)
+                ), result);
             });
-        } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
-            logger.error("Error processing JSON response: {}", e.getMessage(), e);
+        });
+    }
+
+    private static WalkRequest parseDirectWalkRequest(String userInput) {
+        if (userInput == null) {
+            return null;
+        }
+
+        String normalized = userInput.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9\\s]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        boolean mentionsWalk = normalized.matches(".*\\b(walk|move|go)\\b.*");
+        boolean mentionsDirection = normalized.matches(".*\\b(forward|forwards|backward|backwards|back)\\b.*");
+        if (!mentionsWalk || !mentionsDirection) {
+            return null;
+        }
+
+        String direction = normalized.matches(".*\\b(backward|backwards|back)\\b.*") ? "backward" : "forward";
+        int blocks = 1;
+        Matcher blocksMatcher = Pattern.compile("\\b(\\d+)\\s*(?:blocks?|meters?|m)\\b").matcher(normalized);
+        if (blocksMatcher.find()) {
+            blocks = Integer.parseInt(blocksMatcher.group(1));
+        }
+
+        int seconds = blocksToWalkSeconds(blocks);
+        return new WalkRequest(direction, blocks, seconds);
+    }
+
+    private static int blocksToWalkSeconds(int blocks) {
+        return Math.max(1, Math.min(30, (int) Math.ceil(blocks / 4.3)));
+    }
+
+    private static String normalizeWalkDirection(String direction) {
+        if (direction == null) {
+            return "forward";
+        }
+
+        String normalized = direction.toLowerCase(Locale.ROOT).trim();
+        if (normalized.equals("back") || normalized.equals("backward") || normalized.equals("backwards")) {
+            return "backward";
+        }
+        return "forward";
+    }
+
+    private record WalkRequest(String direction, int blocks, int seconds) {}
+
+    private static void storeActionMemory(String functionName, Map<String, String> params, String result) {
+        try {
+            String botName = botSource != null ? botSource.getTextName() : "unknown";
+            String prompt = "Bot " + botName + " executed " + functionName + " with " + params;
+            SQLiteDB.storeMemory("action", prompt, result == null ? "" : result);
+            SQLiteDB.storeMemory("function_call", prompt, result == null ? "" : result);
+            logger.info("Stored action memory: {}", prompt);
+        } catch (Exception e) {
+            logger.warn("Could not store action memory for {}: {}", functionName, e.getMessage());
         }
     }
 
@@ -1151,14 +1409,7 @@ public class FunctionCallerV2 {
         while (!pipelineStack.isEmpty()) {
             JsonObject step = pipelineStack.pop();
             String functionName = step.get("functionName").getAsString();
-            JsonArray parameters = step.getAsJsonArray("parameters");
-            Map<String, String> paramMap = new HashMap<>();
-            for (JsonElement param : parameters) {
-                JsonObject paramObj = param.getAsJsonObject();
-                String paramName = paramObj.get("parameterName").getAsString();
-                String paramValue = resolvePlaceholder(paramObj.get("parameterValue").getAsString(), sharedState);
-                paramMap.put(paramName, paramValue);
-            }
+            Map<String, String> paramMap = parseParameterMap(step.get("parameters"), sharedState);
 
             boolean hasUnresolved = paramMap.values().stream().anyMatch(v -> v.equals("__UNRESOLVED__"));
             if (hasUnresolved) {
@@ -1342,14 +1593,7 @@ public class FunctionCallerV2 {
         while (!pipelineStack.isEmpty()) {
             JsonObject step = pipelineStack.pop();
             String functionName = step.get("functionName").getAsString();
-            JsonArray parameters = step.getAsJsonArray("parameters");
-            Map<String, String> paramMap = new HashMap<>();
-            for (JsonElement param : parameters) {
-                JsonObject paramObj = param.getAsJsonObject();
-                String paramName = paramObj.get("parameterName").getAsString();
-                String paramValue = resolvePlaceholder(paramObj.get("parameterValue").getAsString(), sharedState);
-                paramMap.put(paramName, paramValue);
-            }
+            Map<String, String> paramMap = parseParameterMap(step.get("parameters"), sharedState);
 
             boolean hasUnresolved = paramMap.values().stream().anyMatch(v -> v.equals("__UNRESOLVED__"));
             if (hasUnresolved) {
@@ -1662,6 +1906,59 @@ public class FunctionCallerV2 {
         return value;
     }
 
+    private static Map<String, String> parseParameterMap(JsonElement parametersElement, Map<String, Object> state) {
+        Map<String, String> paramMap = new HashMap<>();
+        if (parametersElement == null || parametersElement.isJsonNull()) {
+            return paramMap;
+        }
+
+        if (parametersElement.isJsonArray()) {
+            for (JsonElement parameter : parametersElement.getAsJsonArray()) {
+                if (!parameter.isJsonObject()) {
+                    logger.warn("Skipping non-object parameter entry: {}", parameter);
+                    continue;
+                }
+
+                JsonObject paramObj = parameter.getAsJsonObject();
+                JsonElement nameElement = paramObj.has("parameterName")
+                        ? paramObj.get("parameterName")
+                        : paramObj.get("name");
+                JsonElement valueElement = paramObj.has("parameterValue")
+                        ? paramObj.get("parameterValue")
+                        : paramObj.get("value");
+
+                if (nameElement == null || valueElement == null || nameElement.isJsonNull()) {
+                    logger.warn("Skipping malformed parameter entry: {}", paramObj);
+                    continue;
+                }
+
+                paramMap.put(nameElement.getAsString(), resolvePlaceholder(jsonValueAsString(valueElement), state));
+            }
+            return paramMap;
+        }
+
+        if (parametersElement.isJsonObject()) {
+            JsonObject paramsObject = parametersElement.getAsJsonObject();
+            for (Map.Entry<String, JsonElement> entry : paramsObject.entrySet()) {
+                paramMap.put(entry.getKey(), resolvePlaceholder(jsonValueAsString(entry.getValue()), state));
+            }
+            return paramMap;
+        }
+
+        logger.warn("Unsupported parameters format: {}", parametersElement);
+        return paramMap;
+    }
+
+    private static String jsonValueAsString(JsonElement element) {
+        if (element == null || element.isJsonNull()) {
+            return "";
+        }
+        if (element.isJsonPrimitive()) {
+            return element.getAsString();
+        }
+        return element.toString();
+    }
+
     private static void updateState(List<String> keys, List<Object> values, Map<String, Object> state) {
         for (int i = 0; i < keys.size(); i++) {
             SharedStateUtils.setValue(state, keys.get(i), values.get(i));
@@ -1670,8 +1967,30 @@ public class FunctionCallerV2 {
     }
 
     private static CompletableFuture<Void> callFunction(String functionName, Map<String, String> paramMap, Map<String, Object> state) {
-        return CompletableFuture.runAsync(() -> {
-            logger.info("🔧 callFunction: {} with params: {}", functionName, paramMap);
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        Runnable task = () -> {
+            try {
+                callFunctionOnCurrentThread(functionName, paramMap, state);
+                future.complete(null);
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        };
+
+        MinecraftServer functionServer = botSource != null ? botSource.getServer() : null;
+        if (functionServer != null && functionServer.isSameThread()) {
+            task.run();
+        } else if (functionServer != null) {
+            functionServer.execute(task);
+        } else {
+            executor.submit(task);
+        }
+
+        return future;
+    }
+
+    private static void callFunctionOnCurrentThread(String functionName, Map<String, String> paramMap, Map<String, Object> state) {
+        logger.info("🔧 callFunction: {} with params: {}", functionName, paramMap);
 
             switch (functionName) {
                 case "goTo" -> {
@@ -1718,6 +2037,33 @@ public class FunctionCallerV2 {
                     String cardinalDirection = resolvePlaceholder(paramMap.get("cardinalDirection"), state);
                     logger.info("Calling method: look with cardinal direction={}", cardinalDirection);
                     Tools.look(cardinalDirection);
+                }
+                case "walk", "moveForward" -> {
+                    String duration = paramMap.getOrDefault("seconds",
+                            paramMap.getOrDefault("duration", paramMap.getOrDefault("till", "1")));
+                    String direction = resolvePlaceholder(paramMap.getOrDefault("direction", "forward"), state);
+                    int seconds = parseDurationSeconds(resolvePlaceholder(duration, state));
+                    logger.info("Calling method: walk with seconds={} direction={}", seconds, direction);
+                    Tools.walk(seconds, direction);
+                }
+                case "hit", "attack" -> {
+                    logger.info("Calling method: {}", functionName);
+                    Tools.hit();
+                }
+                case "action" -> {
+                    String actionName = resolvePlaceholder(paramMap.getOrDefault("action", paramMap.get("name")), state);
+                    logger.info("Calling generic action: {}", actionName);
+                    if ("walk".equalsIgnoreCase(actionName) || "moveForward".equalsIgnoreCase(actionName)) {
+                        String duration = paramMap.getOrDefault("seconds",
+                                paramMap.getOrDefault("duration", paramMap.getOrDefault("till", "1")));
+                        String direction = resolvePlaceholder(paramMap.getOrDefault("direction", "forward"), state);
+                        Tools.walk(parseDurationSeconds(resolvePlaceholder(duration, state)), direction);
+                    } else if ("hit".equalsIgnoreCase(actionName) || "attack".equalsIgnoreCase(actionName)) {
+                        Tools.hit();
+                    } else {
+                        logger.warn("Unknown generic action: {}", actionName);
+                        getFunctionOutput("Unknown action: " + actionName);
+                    }
                 }
                 case "mineBlock" -> {
                     int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
@@ -1812,7 +2158,16 @@ public class FunctionCallerV2 {
             }
 
             logger.info("✓ Function {} execution completed", functionName);
-        });
+            storeActionMemory(functionName, paramMap, functionOutput);
+    }
+
+    private static int parseDurationSeconds(String value) {
+        try {
+            return Math.max(1, (int) Math.ceil(Double.parseDouble(value)));
+        } catch (NumberFormatException e) {
+            logger.warn("Invalid walk duration '{}', defaulting to 1 second", value);
+            return 1;
+        }
     }
 
     /**

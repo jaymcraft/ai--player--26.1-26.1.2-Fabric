@@ -17,6 +17,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -148,11 +150,30 @@ public class RAG2 {
         logger.info("⚡ RAG v2: Running with intent = {} and using provider: {}", intent, client);
 
         try {
-            ensureEmbeddingProvider();
+            if (intent == NLPProcessor.Intent.GENERAL_CONVERSATION && isSimpleGreeting(userPrompt)) {
+                String botName = botSource.getTextName();
+                String greeting = "Hey there! Ready for another Minecraft adventure?";
+                ChatUtils.sendChatMessages(botSource, botName + ": " + greeting);
+                SQLiteDB.storeMemory("chat", userPrompt, greeting);
+                return;
+            }
 
-            List<Double> queryEmbedding = embeddingProvider.generateEmbeddings(userPrompt);
+            List<Double> queryEmbedding;
+            try {
+                ensureEmbeddingProvider();
+                queryEmbedding = embeddingProvider.generateEmbeddings(userPrompt);
+            } catch (Exception embeddingException) {
+                logger.warn("⚠️ Embeddings unavailable, answering without memory context: {}", embeddingException.getMessage());
+                String recentContext = buildRecentMemoryContext();
+                String finalResponse = client.sendPrompt(buildPrompt(),
+                        "Recent memory:\n" + recentContext + "\n\nUser prompt:\n" + userPrompt);
+                processLLMOutput(finalResponse, botSource.getTextName(), botSource);
+                SQLiteDB.storeMemory("chat", userPrompt, finalResponse);
+                return;
+            }
 
             StringBuilder contextBuilder = new StringBuilder();
+            appendRecentMemoryContext(contextBuilder);
 
             if (intent == NLPProcessor.Intent.ASK_INFORMATION) {
                 ChatUtils.sendChatMessages(botSource, "Running web search....");
@@ -196,6 +217,7 @@ public class RAG2 {
             processLLMOutput(finalResponse, botSource.getTextName(), botSource);
 
             // 🔒 Always store final response
+            SQLiteDB.storeMemory("chat", userPrompt, finalResponse, queryEmbedding);
             SQLiteDB.storeMemory("conversation", userPrompt, finalResponse, queryEmbedding);
 
             logger.info("✅ RAG v2 finished with intent-aware strategy.");
@@ -204,6 +226,32 @@ public class RAG2 {
             logger.error("❌ RAG v2 failed: {}", e.getMessage(), e);
             ChatUtils.sendChatMessages(botSource, "Sorry, I couldn't find enough context. Please try again!");
         }
+    }
+
+    private static boolean isSimpleGreeting(String userPrompt) {
+        if (userPrompt == null) {
+            return false;
+        }
+
+        String normalized = userPrompt
+                .replaceAll("§.", "")
+                .replaceAll("[^\\p{IsAlphabetic}\\s]", " ")
+                .trim()
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("\\s+", " ");
+
+        return Set.of(
+                "hi",
+                "hello",
+                "hey",
+                "yo",
+                "sup",
+                "hiya",
+                "howdy",
+                "good morning",
+                "good afternoon",
+                "good evening"
+        ).contains(normalized);
     }
 
     // overloaded method for the existing ollama client to work with.
@@ -216,6 +264,14 @@ public class RAG2 {
 
 
         try {
+            if (intent == NLPProcessor.Intent.GENERAL_CONVERSATION && isSimpleGreeting(userPrompt)) {
+                String botName = botSource.getTextName();
+                String greeting = "Hey there! Ready for another Minecraft adventure?";
+                ChatUtils.sendChatMessages(botSource, botName + ": " + greeting);
+                SQLiteDB.storeMemory("chat", userPrompt, greeting);
+                return;
+            }
+
             // Initialize embedding provider if not already done
             if (embeddingProvider == null) {
                 embeddingProvider = EmbeddingProviderFactory.createEmbeddingProvider(ollamaAPI);
@@ -226,6 +282,7 @@ public class RAG2 {
 
 
             StringBuilder contextBuilder = new StringBuilder();
+            appendRecentMemoryContext(contextBuilder);
 
 
 
@@ -321,6 +378,7 @@ public class RAG2 {
 
             // 🔒 Always store final response
 
+            SQLiteDB.storeMemory("chat", userPrompt, finalResponse, queryEmbedding);
             SQLiteDB.storeMemory("conversation", userPrompt, finalResponse, queryEmbedding);
 
 
@@ -337,5 +395,29 @@ public class RAG2 {
 
         }
 
+    }
+
+    private static String buildRecentMemoryContext() {
+        StringBuilder contextBuilder = new StringBuilder();
+        appendRecentMemoryContext(contextBuilder);
+        return contextBuilder.toString().trim();
+    }
+
+    private static void appendRecentMemoryContext(StringBuilder contextBuilder) {
+        List<SQLiteDB.Memory> recentMemories = SQLiteDB.fetchRecentMemories(List.of("chat", "action"), 10);
+        if (recentMemories.isEmpty()) {
+            return;
+        }
+
+        contextBuilder.append("Recent chat and action memory:\n");
+        for (SQLiteDB.Memory memory : recentMemories) {
+            contextBuilder.append("- [").append(memory.type()).append("] ");
+            contextBuilder.append(memory.prompt());
+            if (memory.response() != null && !memory.response().isBlank()) {
+                contextBuilder.append(" -> ").append(memory.response());
+            }
+            contextBuilder.append("\n");
+        }
+        contextBuilder.append("\n");
     }
 }

@@ -140,7 +140,7 @@ public class EmbeddingProvider {
         requestJson.addProperty("input", text);
         requestJson.addProperty("model", embeddingModel);
 
-        String endpoint = baseUrl + "/v1/embeddings";
+        String endpoint = buildOpenAICompatibleEndpoint(baseUrl, "embeddings");
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(endpoint))
                 .header("Content-Type", "application/json");
@@ -172,6 +172,27 @@ public class EmbeddingProvider {
 
         LOGGER.debug("✅ Generated OpenAI-compatible embeddings: {} dimensions", embeddings.size());
         return embeddings;
+    }
+
+    private static String buildOpenAICompatibleEndpoint(String rawBaseUrl, String path) {
+        String normalized = rawBaseUrl.trim().replaceAll("/+$", "");
+        if (normalized.endsWith("/chat/completions")) {
+            normalized = normalized.substring(0, normalized.length() - "/chat/completions".length());
+        } else if (normalized.endsWith("/completions")) {
+            normalized = normalized.substring(0, normalized.length() - "/completions".length());
+        } else if (normalized.endsWith("/chat")) {
+            normalized = normalized.substring(0, normalized.length() - "/chat".length());
+        } else if (normalized.endsWith("/embeddings")) {
+            normalized = normalized.substring(0, normalized.length() - "/embeddings".length());
+        }
+
+        if (normalized.equals("https://openrouter.ai")) {
+            normalized = "https://openrouter.ai/api/v1";
+        } else if (!normalized.endsWith("/v1") && !normalized.endsWith("/api/v1")) {
+            normalized = normalized + "/v1";
+        }
+
+        return normalized + "/" + path;
     }
 
     /**
@@ -300,4 +321,3 @@ public class EmbeddingProvider {
         return providerType;
     }
 }
-

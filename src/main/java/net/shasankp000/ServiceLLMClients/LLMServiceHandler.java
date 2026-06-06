@@ -111,27 +111,33 @@ public class LLMServiceHandler {
     public static void sendInitialResponse(CommandSourceStack botSource, LLMClient client) {
         MinecraftServer server = botSource.getServer();
         String botName = botSource.getPlayer().getName().getString();
+        isInitialized = false;
+        initialResponse = "";
 
         CompletableFuture<String> initFuture = CompletableFuture.supplyAsync(() -> {
             try {
-                if (client.isReachable()) {
+                if (!client.isReachable()) {
+                    LOGGER.warn("{} reachability check failed; attempting initial chat request anyway.", client.getProvider());
+                }
+
+                String response = client.sendPrompt(generateSystemPrompt(botName), "Initializing chat");
+                LOGGER.info("Initial response received: '{}'", response);
+                LOGGER.info("Response length: {}", response != null ? response.length() : "null");
+
+                if (response != null && !response.trim().isEmpty() && !response.startsWith("Error:")) {
                     isInitialized = true;
                     LOGGER.info("{} client initialized.", client.getProvider());
                     ChatUtils.sendChatMessages(botSource, "Established connection to " + client.getProvider() + "'s servers. Using " + AIPlayer.CONFIG.getSelectedLanguageModel());
-
-                    // Fetch and return the initial response
-                    String response = client.sendPrompt(generateSystemPrompt(botName), "Initializing chat");
-                    LOGGER.info("Initial response received: '{}'", response);
-                    LOGGER.info("Response length: {}", response != null ? response.length() : "null");
                     initialResponse = response;
                     return response;
                 } else {
-                    LOGGER.error("Error! Could not reach {} client. Please try again!", client.getProvider());
-                    ChatUtils.sendChatMessages(botSource, "Error! Could not reach " + client.getProvider() + "'s servers. Please check your internet connection or try again after sometime!");
+                    LOGGER.error("Error! Could not initialize {} client. Response: {}", client.getProvider(), response);
+                    ChatUtils.sendChatMessages(botSource, "Error! Could not initialize " + client.getProvider() + ". Check your API URL, API key, and selected model.");
                     return null;
                 }
             } catch (Exception e) {
                 LOGGER.error("Exception in initFuture: {}", e.getMessage(), e);
+                ChatUtils.sendChatMessages(botSource, "Error! Could not initialize " + client.getProvider() + ": " + e.getMessage());
                 return null;
             }
         });
@@ -235,7 +241,7 @@ public class LLMServiceHandler {
                 LOGGER.warn("⚠️ Intent unclear, retrying with LLM classification...");
                 ChatUtils.sendChatMessages(botSource, "🔍 Reanalyzing...");
 
-                NLPProcessor.Intent retry = retryIntentLLM(message);
+                NLPProcessor.Intent retry = retryIntentLLM(message, client);
 
                 LOGGER.info("📨 Retry intent: {}", retry);
 
@@ -251,7 +257,7 @@ public class LLMServiceHandler {
                         Thread.currentThread().setName("LLM-Function-Caller-Retry-Worker");
                         LOGGER.info("🧵 Started FunctionCallerV2 retry worker thread");
                         new FunctionCallerV2(botSource, playerUUID);
-                        FunctionCallerV2.run(message);
+                        FunctionCallerV2.run(message, client);
                         LOGGER.info("✅ Finished FunctionCallerV2 retry worker thread");
                     });
                 } else {
@@ -262,7 +268,7 @@ public class LLMServiceHandler {
     }
 
 
-    private static NLPProcessor.Intent retryIntentLLM(String message) {
-        return NLPProcessor.getIntentionFromLLM(message);
+    private static NLPProcessor.Intent retryIntentLLM(String message, LLMClient client) {
+        return NLPProcessor.getIntentionFromLLM(message, client);
     }
 }

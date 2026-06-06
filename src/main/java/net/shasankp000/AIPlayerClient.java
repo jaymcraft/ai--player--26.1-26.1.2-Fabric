@@ -40,18 +40,16 @@ public class AIPlayerClient implements ClientModInitializer {
 
 
     static {
-        try {
-            botProfiles = GSON.fromJson(Files.newBufferedReader(BOT_PROFILE_PATH), JsonObject.class);
-        } catch (IOException e) {
-            System.out.println("Bot profiles not found yet — continuing with no bots registered.");
-            botProfiles = null; // Explicitly fallback to safe null
-        }
+        reloadBotProfiles();
     }
 
 
     private static String getBotNameIfMentioned(String message) {
+        reloadBotProfiles();
+        JsonObject profiles = getBotProfiles();
+        if (profiles == null) return null;
+
         String[] words = message.split("\\s+");
-        JsonObject profiles = botProfiles.getAsJsonObject("botGameProfile");
         for (String word : words) {
             String cleaned = word.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
             for (String botName : profiles.keySet()) {
@@ -63,12 +61,27 @@ public class AIPlayerClient implements ClientModInitializer {
         return null;
     }
 
+    private static void reloadBotProfiles() {
+        try (java.io.Reader reader = Files.newBufferedReader(BOT_PROFILE_PATH)) {
+            botProfiles = GSON.fromJson(reader, JsonObject.class);
+        } catch (IOException e) {
+            System.out.println("Bot profiles not found yet - continuing with no bots registered.");
+            botProfiles = null;
+        }
+    }
+
+    private static JsonObject getBotProfiles() {
+        if (botProfiles == null || !botProfiles.has("botGameProfile") || botProfiles.get("botGameProfile").isJsonNull()) {
+            return null;
+        }
+        return botProfiles.getAsJsonObject("botGameProfile");
+    }
+
 
 
     private static boolean isMessageFromBot(String rawMessage) {
-        if (botProfiles == null) return false;
-
-        JsonObject profiles = botProfiles.getAsJsonObject("botGameProfile");
+        reloadBotProfiles();
+        JsonObject profiles = getBotProfiles();
         if (profiles == null) return false;
 
         for (String botName : profiles.keySet()) {
@@ -81,10 +94,9 @@ public class AIPlayerClient implements ClientModInitializer {
 
 
     private static boolean isMessageFromServerContainsBotName(String rawMessage) {
-        if (botProfiles == null) return false;
-
         if (rawMessage.startsWith("[Server]")) {
-            JsonObject profiles = botProfiles.getAsJsonObject("botGameProfile");
+            reloadBotProfiles();
+            JsonObject profiles = getBotProfiles();
             if (profiles == null) return false;
 
             for (String botName : profiles.keySet()) {
@@ -258,7 +270,7 @@ public class AIPlayerClient implements ClientModInitializer {
             if (botName != null) {
 
                 switch (llmProvider) {
-                    case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok":
+                    case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom":
                         LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
 
                         if (llmClient!=null) {

@@ -13,6 +13,7 @@ import net.shasankp000.ChatUtils.DecisionResolver.DecisionResolver;
 import net.shasankp000.ChatUtils.LIDSNetModel.LIDSNetModelManager;
 import net.shasankp000.ChatUtils.PreProcessing.NLPModelSetup;
 import net.shasankp000.ChatUtils.PreProcessing.OpenNLPProcessor;
+import net.shasankp000.ServiceLLMClients.LLMClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -436,6 +437,12 @@ public class NLPProcessor {
     // -------------------------------
 
     public static Intent getIntention(String userPrompt) {
+        Intent deterministicIntent = classifyDeterministicIntent(userPrompt);
+        if (deterministicIntent != null) {
+            LOGGER.info("Deterministic intent override: {} for '{}'", deterministicIntent, userPrompt);
+            return deterministicIntent;
+        }
+
         Path configDir = FabricLoader.getInstance().getConfigDir();
         Path modelDir = configDir.resolve("ai-player/NLPModels");
         Path cartDir = modelDir.resolve("cart_files");
@@ -568,8 +575,50 @@ public class NLPProcessor {
             LOGGER.error("Error while resolving the final decision: {}", e.getMessage());
         }
 
-        return Intent.valueOf(decision);
+        if (decision == null || decision.isBlank()) {
+            LOGGER.warn("Intent resolver returned no decision for '{}'", userPrompt);
+            return Intent.UNSPECIFIED;
+        }
 
+        try {
+            return Intent.valueOf(decision);
+        } catch (IllegalArgumentException e) {
+            LOGGER.warn("Intent resolver returned invalid decision '{}' for '{}'", decision, userPrompt);
+            return Intent.UNSPECIFIED;
+        }
+
+    }
+
+    private static Intent classifyDeterministicIntent(String userPrompt) {
+        if (userPrompt == null) {
+            return Intent.UNSPECIFIED;
+        }
+
+        String normalized = userPrompt
+                .replaceAll("§.", "")
+                .replaceAll("^\\[[^]]+]\\s*", "")
+                .replaceAll("[^\\p{IsAlphabetic}\\p{IsDigit}\\s]", " ")
+                .trim()
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("\\s+", " ");
+
+        if (normalized.isBlank()) {
+            return Intent.UNSPECIFIED;
+        }
+
+        Set<String> greetings = Set.of(
+                "hi", "hello", "hey", "yo", "sup", "hiya", "howdy",
+                "good morning", "good afternoon", "good evening"
+        );
+        if (greetings.contains(normalized)) {
+            return Intent.GENERAL_CONVERSATION;
+        }
+
+        if (normalized.matches("^(hi|hello|hey|yo|sup|hiya|howdy)\\s+.+")) {
+            return Intent.GENERAL_CONVERSATION;
+        }
+
+        return null;
     }
 
 
@@ -609,6 +658,31 @@ public class NLPProcessor {
             }
         } catch (Exception e) {
             LOGGER.error("LLM fallback failed: {}", e.getMessage(), e);
+        }
+        return Intent.UNSPECIFIED;
+    }
+
+    public static Intent getIntentionFromLLM(String userPrompt, LLMClient client) {
+        if (client == null) {
+            return getIntentionFromLLM(userPrompt);
+        }
+
+        try {
+            String response = client.sendPrompt(buildPrompt(), userPrompt);
+            if (response == null) {
+                return Intent.UNSPECIFIED;
+            }
+
+            String normalized = stripThinkTags(response).trim();
+            if (normalized.equalsIgnoreCase("REQUEST_ACTION") || normalized.contains("REQUEST_ACTION")) {
+                return Intent.REQUEST_ACTION;
+            } else if (normalized.equalsIgnoreCase("ASK_INFORMATION") || normalized.contains("ASK_INFORMATION")) {
+                return Intent.ASK_INFORMATION;
+            } else if (normalized.equalsIgnoreCase("GENERAL_CONVERSATION") || normalized.contains("GENERAL_CONVERSATION")) {
+                return Intent.GENERAL_CONVERSATION;
+            }
+        } catch (Exception e) {
+            LOGGER.error("{} fallback failed: {}", client.getProvider(), e.getMessage(), e);
         }
         return Intent.UNSPECIFIED;
     }

@@ -134,7 +134,7 @@ public class modCommandRegistry {
                                         .then(Commands.argument("message", StringArgumentType.greedyString())
                                                 .executes(context -> {
 
-                                                    ollamaClient.execute(context);
+                                                    executeLLMChat(context);
 
                                                      return 1;
 
@@ -303,8 +303,8 @@ public class modCommandRegistry {
                                                         return 0;
                                                     }
 
-                                                    // Detect nearby hostile entities AND hostile players within 40 blocks
-                                                    List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, 40);
+                                                    // Detect nearby hostile entities AND hostile players within configured hostile range
+                                                    List<Entity> nearbyEntities = AutoFaceEntity.detectNearbyEntities(bot, AutoFaceEntity.HOSTILE_DETECTION_RANGE);
                                                     List<Entity> hostileEntities = nearbyEntities.stream()
                                                             .filter(entity -> {
                                                                 // Include hostile mobs
@@ -322,7 +322,7 @@ public class modCommandRegistry {
 
                                                     if (hostileEntities.isEmpty()) {
                                                         if (debugMode.equals("true")) {
-                                                            ChatUtils.sendChatMessages(botSource, "No hostile entities or players detected within 40 blocks!");
+                                                            ChatUtils.sendChatMessages(botSource, "No hostile entities or players detected within " + (int) AutoFaceEntity.HOSTILE_DETECTION_RANGE + " blocks!");
                                                         }
 
                                                         return 0;
@@ -913,6 +913,45 @@ public class modCommandRegistry {
         ));
     }
 
+    private static void executeLLMChat(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+        String targetBotName = EntityArgument.getPlayer(context, "bot").getName().tryCollapseToString();
+        String message = StringArgumentType.getString(context, "message");
+        MinecraftServer server = context.getSource().getServer();
+        CommandSourceStack playerSource = context.getSource();
+        ServerPlayer bot = server.getPlayerList().getPlayerByName(targetBotName);
+
+        if (bot == null) {
+            ChatUtils.sendSystemMessage(playerSource, "Bot " + targetBotName + " is not online.");
+            return;
+        }
+
+        String formatter = ChatUtils.getRandomColorCode();
+        CommandSourceStack botSource = bot.createCommandSourceStack().withSuppressedOutput();
+
+        server.execute(() -> {
+            server.getCommands().performPrefixedCommand(playerSource, "/say " + formatter + message);
+            server.getCommands().performPrefixedCommand(botSource, "/say Processing your message, please wait.");
+        });
+
+        String llmProvider = getConfiguredLlmProvider();
+        switch (llmProvider) {
+            case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom" -> {
+                LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
+                if (llmClient == null) {
+                    ChatUtils.sendSystemMessage(playerSource, "Cannot initialize " + llmProvider + ": missing or invalid API configuration.");
+                    return;
+                }
+                UUID playerUUID = Objects.requireNonNull(playerSource.getPlayer()).getUUID();
+                LLMServiceHandler.runFromChat(message, targetBotName, playerUUID, llmClient);
+            }
+            case "ollama" -> ollamaClient.runFromChat(targetBotName, message, Objects.requireNonNull(playerSource.getPlayer()).getUUID());
+            default -> {
+                LOGGER.warn("Unsupported provider {}. Defaulting to Ollama client.", llmProvider);
+                ollamaClient.runFromChat(targetBotName, message, Objects.requireNonNull(playerSource.getPlayer()).getUUID());
+            }
+        }
+    }
+
 
     private static void spawnBot(CommandContext<CommandSourceStack> context, String spawnMode) {
         try {
@@ -940,12 +979,13 @@ public class modCommandRegistry {
         botName = StringArgumentType.getString(context, "bot_name");
 
         CommandSourceStack serverSource = server.createCommandSourceStack();
+        String requestedBotName = botName;
 
 
         if (spawnMode.equals("training")) {
 
             createFakePlayer.createFake(
-                    botName,
+                    requestedBotName,
                     server,
                     pos,
                     facing.y,
@@ -953,34 +993,33 @@ public class modCommandRegistry {
                     dimType,
                     mode,
                     false
-            );
+            ).thenAccept(bot -> {
+                if (bot == null) {
+                    ChatUtils.sendSystemMessage(serverSource, "Error: " + requestedBotName + " cannot be spawned");
+                    return;
+                }
 
-            isTrainingMode = true;
+                isTrainingMode = true;
 
-            LOGGER.info("Spawned new bot {}!", botName);
-
-            ServerPlayer bot = server.getPlayerList().getPlayerByName(botName);
-
-            if (bot!=null) {
+                LOGGER.info("Spawned new bot {}!", requestedBotName);
 
                 setBotKnockbackResistance(bot);
 
                 RespawnHandler.registerRespawnListener(bot);
 
                 AutoFaceEntity.startAutoFace(bot);
-
-            }
-
-            else {
-                ChatUtils.sendSystemMessage(serverSource, "Error: " + botName + " cannot be spawned");
-            }
+            }).exceptionally(throwable -> {
+                LOGGER.error("Failed to spawn training bot {}", requestedBotName, throwable);
+                ChatUtils.sendSystemMessage(serverSource, "Error: " + requestedBotName + " cannot be spawned");
+                return null;
+            });
 
             // don't initialize ollama client.
 
         } else if (spawnMode.equals("play")) {
 
             createFakePlayer.createFake(
-                    botName,
+                    requestedBotName,
                     server,
                     pos,
                     facing.y,
@@ -988,17 +1027,15 @@ public class modCommandRegistry {
                     dimType,
                     mode,
                     false
-            );
+            ).thenAccept(bot -> {
+                if (bot == null) {
+                    ChatUtils.sendSystemMessage(serverSource, "Error: " + requestedBotName + " cannot be spawned");
+                    return;
+                }
 
+                LOGGER.info("Spawned new bot {}!", requestedBotName);
 
-
-            LOGGER.info("Spawned new bot {}!", botName);
-
-            ServerPlayer bot = server.getPlayerList().getPlayerByName(botName);
-
-            System.out.println("Preparing for connection to language model....");
-
-            if (bot!=null) {
+                System.out.println("Preparing for connection to language model....");
 
                 setBotKnockbackResistance(bot);
 
@@ -1006,13 +1043,13 @@ public class modCommandRegistry {
 
                 RespawnHandler.registerRespawnListener(bot);
 
-                ollamaClient.botName = botName; // set the bot's name.
+                ollamaClient.resetForBot(requestedBotName);
 
-                System.out.println("Set bot's username to " + botName);
+                System.out.println("Set bot's username to " + requestedBotName);
 
-                String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
+                String llmProvider = getConfiguredLlmProvider();
 
-                System.out.println("Using provider");
+                System.out.println("Using provider: " + llmProvider);
 
                 switch (llmProvider) {
                     case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom":
@@ -1024,7 +1061,7 @@ public class modCommandRegistry {
                             break;
                         }
 
-                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + botName + " connects to " + llmClient.getProvider() + "'s servers.");
+                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + requestedBotName + " connects to " + llmClient.getProvider() + "'s servers.");
                         LLMServiceHandler.sendInitialResponse(bot.createCommandSourceStack().withSuppressedOutput(), llmClient);
 
                         new Thread(() -> {
@@ -1061,7 +1098,7 @@ public class modCommandRegistry {
                         break;
 
                     case "ollama":
-                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + botName + " connects to the language model.");
+                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + requestedBotName + " connects to the language model.");
                         ollamaClient.initializeOllamaClient();
 
                         new Thread(() -> {
@@ -1074,7 +1111,7 @@ public class modCommandRegistry {
                                     if (waitCount % 10 == 0) { // Log every 5 seconds
                                         LOGGER.warn("Still waiting for Ollama initialization... ({} seconds)", waitCount / 2);
                                     }
-                                    if (waitCount > 60) { // 30 second timeout
+                                    if (waitCount > 600) { // 5 minute timeout
                                         LOGGER.error("Ollama initialization timeout! Starting AutoFace anyway.");
                                         AutoFaceEntity.startAutoFace(bot);
                                         Thread.currentThread().interrupt();
@@ -1101,7 +1138,7 @@ public class modCommandRegistry {
                     default:
                         LOGGER.warn("Unsupported provider detected. Defaulting to Ollama client");
                         ChatUtils.sendSystemMessage(serverSource, "Warning! Unsupported provider detected. Defaulting to Ollama client");
-                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + botName + " connects to the language model.");
+                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + requestedBotName + " connects to the language model.");
                         ollamaClient.initializeOllamaClient();
 
                         new Thread(() -> {
@@ -1126,13 +1163,11 @@ public class modCommandRegistry {
                         break;
 
                 }
-
-            }
-
-
-            else {
-                ChatUtils.sendSystemMessage(serverSource, "Error: " + botName + " cannot be spawned");
-            }
+            }).exceptionally(throwable -> {
+                LOGGER.error("Failed to spawn play bot {}", requestedBotName, throwable);
+                ChatUtils.sendSystemMessage(serverSource, "Error: " + requestedBotName + " cannot be spawned");
+                return null;
+            });
 
         }
         else {
@@ -1159,6 +1194,15 @@ public class modCommandRegistry {
             return e.getClass().getSimpleName();
         }
         return e.getClass().getSimpleName() + ": " + message;
+    }
+
+    private static String getConfiguredLlmProvider() {
+        String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
+        if (llmProvider == null || llmProvider.isBlank()) {
+            LOGGER.warn("aiplayer.llmMode is empty. Defaulting to ollama.");
+            return "ollama";
+        }
+        return llmProvider.trim();
     }
 
     private static void notImplementedMessage(CommandContext<CommandSourceStack> context) {

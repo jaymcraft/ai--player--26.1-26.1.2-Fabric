@@ -23,7 +23,11 @@ import java.util.List;
 public class OllamaAPIHelper {
     private static final Logger LOGGER = LoggerFactory.getLogger("ai-player-ollama-helper");
     private static final Gson gson = new Gson();
-    private static final HttpClient httpClient = HttpClient.newHttpClient();
+        private static final java.time.Duration CONNECT_TIMEOUT = java.time.Duration.ofSeconds(60);
+        private static final java.time.Duration REQUEST_TIMEOUT = java.time.Duration.ofSeconds(600);
+        private static final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(CONNECT_TIMEOUT)
+            .build();
 
     /**
      * Sends a chat request with thinking mode enabled
@@ -60,10 +64,11 @@ public class OllamaAPIHelper {
         // Send HTTP POST request
         String endpoint = host + "/api/chat";
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(endpoint))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(requestJson.toString()))
-                .build();
+            .uri(URI.create(endpoint))
+            .header("Content-Type", "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .POST(HttpRequest.BodyPublishers.ofString(requestJson.toString()))
+            .build();
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
