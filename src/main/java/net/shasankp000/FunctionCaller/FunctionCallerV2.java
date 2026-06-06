@@ -27,6 +27,8 @@ import java.util.regex.Pattern;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -982,6 +984,9 @@ public class FunctionCallerV2 {
 
     public static void run(String userPrompt) {
         ollamaAPI.setRequestTimeoutSeconds(600);
+        if (tryHandleDirectHouseBuild(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectWalk(userPrompt)) {
             return;
         }
@@ -1022,6 +1027,9 @@ public class FunctionCallerV2 {
     }
 
     public static void run(String userPrompt, LLMClient client) {
+        if (tryHandleDirectHouseBuild(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectWalk(userPrompt)) {
             return;
         }
@@ -1345,6 +1353,159 @@ public class FunctionCallerV2 {
     }
 
     private record WalkRequest(String direction, int blocks, int seconds) {}
+
+    private static boolean tryHandleDirectHouseBuild(String userInput) {
+        if (!isHouseBuildRequest(userInput)) {
+            return false;
+        }
+
+        if (botSource == null || botSource.getPlayer() == null) {
+            logger.warn("Direct house build request ignored because botSource/player is null");
+            return false;
+        }
+
+        Optional<Block> requestedBlock = extractHouseBlock(userInput);
+        if (requestedBlock.isEmpty()) {
+            String clarification = "What type of block should I use for the house?";
+            ChatContextManager.setPendingClarification(playerUUID, "build a house", clarification, botSource.getTextName());
+            sendMessageToPlayer(clarification);
+            return true;
+        }
+
+        buildSimpleHouseAtBot(requestedBlock.get());
+        return true;
+    }
+
+    private static boolean isHouseBuildRequest(String userInput) {
+        if (userInput == null) {
+            return false;
+        }
+
+        String normalized = userInput.toLowerCase(Locale.ROOT);
+        if (normalized.contains("original:") && normalized.contains("build") && normalized.contains("house")) {
+            return true;
+        }
+
+        return normalized.matches(".*\\b(build|make|construct)\\b.*\\b(house|home|hut|base)\\b.*");
+    }
+
+    private static Optional<Block> extractHouseBlock(String userInput) {
+        String materialText = extractClarificationAnswer(userInput).orElseGet(() -> extractInlineHouseMaterial(userInput));
+        if (materialText == null || materialText.isBlank()) {
+            return Optional.empty();
+        }
+
+        String normalizedBlockName = BlockNameNormalizer.normalizeBlockName(materialText);
+        Identifier blockId = Identifier.tryParse(normalizedBlockName);
+        if (blockId == null) {
+            return Optional.empty();
+        }
+
+        Optional<Block> block = BuiltInRegistries.BLOCK.getOptional(blockId);
+        if (block.isEmpty() || block.get() == Blocks.AIR || block.get() == Blocks.CAVE_AIR || block.get() == Blocks.VOID_AIR) {
+            logger.warn("Invalid house block requested: {}", materialText);
+            return Optional.empty();
+        }
+
+        return block;
+    }
+
+    private static Optional<String> extractClarificationAnswer(String userInput) {
+        Matcher matcher = Pattern.compile("(?is)player answer:\\s*(.+)$").matcher(userInput);
+        if (!matcher.find()) {
+            return Optional.empty();
+        }
+
+        String answer = matcher.group(1)
+                .replaceAll("[\\r\\n].*", "")
+                .replaceAll("[^a-zA-Z0-9:_\\-\\s]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+        return answer.isBlank() ? Optional.empty() : Optional.of(answer);
+    }
+
+    private static String extractInlineHouseMaterial(String userInput) {
+        if (userInput == null) {
+            return "";
+        }
+
+        Matcher matcher = Pattern.compile(
+                "(?i)\\b(?:out of|with|using|from|made of)\\s+([a-z0-9:_\\-\\s]+?)(?:\\s+(?:at|where|near|please|now)\\b|[,.!?]|$)"
+        ).matcher(userInput);
+        if (!matcher.find()) {
+            return "";
+        }
+
+        return matcher.group(1).replaceAll("\\s+", " ").trim();
+    }
+
+    private static void buildSimpleHouseAtBot(Block wallBlock) {
+        MinecraftServer server = botSource.getServer();
+        ServerPlayer bot = botSource.getPlayer();
+        ServerLevel world = (ServerLevel) bot.level();
+        BlockPos origin = bot.blockPosition();
+        Direction doorwayDirection = bot.getDirection();
+        Identifier blockId = BuiltInRegistries.BLOCK.getKey(wallBlock);
+
+        AutoFaceEntity.setBotExecutingTask(true);
+        server.execute(() -> {
+            try {
+                placeHouseBlocks(world, origin, doorwayDirection, wallBlock);
+                String result = "Built a small house using " + blockId + " at x:" + origin.getX()
+                        + " y:" + origin.getY() + " z:" + origin.getZ() + ".";
+                getFunctionOutput(result);
+                storeActionMemory("buildHouse", Map.of(
+                        "blockType", blockId.toString(),
+                        "x", String.valueOf(origin.getX()),
+                        "y", String.valueOf(origin.getY()),
+                        "z", String.valueOf(origin.getZ())
+                ), result);
+                ChatUtils.sendChatMessages(botSource, result);
+            } catch (Exception e) {
+                logger.error("Failed to build house", e);
+                ChatUtils.sendChatMessages(botSource, "I couldn't build the house: " + e.getMessage());
+            } finally {
+                AutoFaceEntity.setBotExecutingTask(false);
+            }
+        });
+    }
+
+    private static void placeHouseBlocks(ServerLevel world, BlockPos origin, Direction doorwayDirection, Block wallBlock) {
+        var wallState = wallBlock.defaultBlockState();
+
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                world.setBlock(origin.offset(dx, -1, dz), wallState, 3);
+            }
+        }
+
+        for (int dy = 0; dy <= 3; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    boolean perimeter = dx == -2 || dx == 2 || dz == -2 || dz == 2;
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    world.setBlock(pos, perimeter ? wallState : Blocks.AIR.defaultBlockState(), 3);
+                }
+            }
+        }
+
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                world.setBlock(origin.offset(dx, 4, dz), wallState, 3);
+            }
+        }
+
+        BlockPos doorway = switch (doorwayDirection) {
+            case NORTH -> origin.offset(0, 0, -2);
+            case SOUTH -> origin.offset(0, 0, 2);
+            case EAST -> origin.offset(2, 0, 0);
+            case WEST -> origin.offset(-2, 0, 0);
+            default -> origin.offset(0, 0, -2);
+        };
+
+        world.setBlock(doorway, Blocks.AIR.defaultBlockState(), 3);
+        world.setBlock(doorway.above(), Blocks.AIR.defaultBlockState(), 3);
+    }
 
     private static void storeActionMemory(String functionName, Map<String, String> params, String result) {
         try {
