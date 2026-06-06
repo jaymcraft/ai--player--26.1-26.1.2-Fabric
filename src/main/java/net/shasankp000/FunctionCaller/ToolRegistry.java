@@ -278,6 +278,18 @@ public class ToolRegistry {
             ),
 
             new Tool(
+                    "speedrunDragon",
+                    """
+                    Starts or updates a player-like Ender Dragon speedrun route.
+                    The bot checks its inventory and dimension, chooses the next speedrun stage, and reports what it needs next.
+                    It must not use creative shortcuts, teleport-kill behavior, phasing, or impossible block placement.
+                    """,
+                    List.of(),
+                    Set.of("dragonSpeedrun.stage", "dragonSpeedrun.nextAction"),
+                    (sharedState, paramMap, result) -> sharedState.put("dragonSpeedrun.active", true)
+            ),
+
+            new Tool(
                     "searchBlocks",
                     """
                     Efficiently searches for blocks in an expanding radius around the bot.

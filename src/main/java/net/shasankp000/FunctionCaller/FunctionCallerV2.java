@@ -992,6 +992,9 @@ public class FunctionCallerV2 {
 
     public static void run(String userPrompt) {
         ollamaAPI.setRequestTimeoutSeconds(600);
+        if (tryHandleDirectDragonSpeedrun(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectDrop(userPrompt)) {
             return;
         }
@@ -1041,6 +1044,9 @@ public class FunctionCallerV2 {
     }
 
     public static void run(String userPrompt, LLMClient client) {
+        if (tryHandleDirectDragonSpeedrun(userPrompt)) {
+            return;
+        }
         if (tryHandleDirectDrop(userPrompt)) {
             return;
         }
@@ -1277,24 +1283,43 @@ public class FunctionCallerV2 {
         executor.submit(() -> {
             logger.info("Executing precise direct walk for {} from {} to {} over {} ticks",
                     botName, start, target, ticks);
+            try {
+                rescueBotIfStuck(bot).get(2, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                logger.warn("Could not run unstuck check before direct walk", e);
+            }
             for (int tick = 0; tick < ticks; tick++) {
                 double progress = (tick + 1) / (double) ticks;
                 Vec3 next = start.lerp(target, progress);
-                server.execute(() -> bot.teleportTo(
-                        bot.level(),
-                        next.x,
-                        next.y,
-                        next.z,
-                        Set.of(),
-                        bot.getYRot(),
-                        bot.getXRot(),
-                        false
-                ));
+                CompletableFuture<Boolean> step = new CompletableFuture<>();
+                server.execute(() -> {
+                    if (!canBotOccupy(bot, next)) {
+                        step.complete(false);
+                        return;
+                    }
+                    bot.teleportTo(
+                            bot.level(),
+                            next.x,
+                            next.y,
+                            next.z,
+                            Set.of(),
+                            bot.getYRot(),
+                            bot.getXRot(),
+                            false
+                    );
+                    step.complete(true);
+                });
 
                 try {
+                    if (!step.get(1, TimeUnit.SECONDS)) {
+                        break;
+                    }
                     Thread.sleep(50L);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    logger.warn("Direct walk stopped because movement was blocked", e);
                     break;
                 }
             }
@@ -1306,19 +1331,11 @@ public class FunctionCallerV2 {
             }
 
             server.execute(() -> {
-                bot.teleportTo(
-                        bot.level(),
-                        target.x,
-                        target.y,
-                        target.z,
-                        Set.of(),
-                        bot.getYRot(),
-                        bot.getXRot(),
-                        false
-                );
                 AutoFaceEntity.isBotMoving = false;
                 AutoFaceEntity.setBotExecutingTask(false);
-                String result = "Walked " + walkRequest.blocks + " blocks " + walkRequest.direction + ".";
+                String result = canBotOccupy(bot, target)
+                        ? "Walked " + walkRequest.blocks + " blocks " + walkRequest.direction + "."
+                        : "Stopped walking because a solid block was in the way.";
                 getFunctionOutput(result);
                 storeActionMemory("directWalk", Map.of(
                         "blocks", String.valueOf(walkRequest.blocks),
@@ -1373,6 +1390,390 @@ public class FunctionCallerV2 {
     }
 
     private record WalkRequest(String direction, int blocks, int seconds) {}
+
+    private static boolean tryHandleDirectDragonSpeedrun(String userInput) {
+        if (!isDragonSpeedrunRequest(userInput)) {
+            return false;
+        }
+
+        if (botSource == null || botSource.getPlayer() == null) {
+            logger.warn("Dragon speedrun request ignored because botSource/player is null");
+            return false;
+        }
+
+        startDragonSpeedrunPlan();
+        return true;
+    }
+
+    private static boolean isDragonSpeedrunRequest(String userInput) {
+        if (userInput == null) {
+            return false;
+        }
+
+        String normalized = userInput.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9\\s]", " ");
+        boolean speedrunIntent = normalized.matches(".*\\b(speedrun|beat|kill|defeat|finish)\\b.*");
+        boolean dragonTarget = normalized.matches(".*\\b(ender\\s+dragon|dragon)\\b.*");
+        return normalized.matches(".*\\bspeed\\s*run\\b.*")
+                || normalized.matches(".*\\bspeedrun\\b.*")
+                || (speedrunIntent && dragonTarget);
+    }
+
+    private static void startDragonSpeedrunPlan() {
+        if (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active"))) {
+            String alreadyRunning = "I'm already trying to beat the game.";
+            getFunctionOutput(alreadyRunning);
+            ChatUtils.sendChatMessages(botSource, alreadyRunning);
+            return;
+        }
+
+        sharedState.put("dragonSpeedrun.active", true);
+        ChatUtils.sendChatMessages(botSource, "Starting an actual player-like Ender Dragon run. I'll gather, craft, mine, and advance stages without creative shortcuts.");
+
+        executor.submit(() -> {
+            try {
+                runDragonSpeedrunWorker();
+            } finally {
+                sharedState.put("dragonSpeedrun.active", false);
+            }
+        });
+    }
+
+    private static void runDragonSpeedrunWorker() {
+        ServerPlayer bot = botSource.getPlayer();
+        if (bot == null) {
+            getFunctionOutput("Bot not found.");
+            return;
+        }
+
+        int actions = 0;
+        String lastResult = "Started Ender Dragon speedrun.";
+        while (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active")) && actions < 80) {
+            bot = botSource.getPlayer();
+            if (bot == null) {
+                lastResult = "Bot not found.";
+                break;
+            }
+
+            Inventory inventory = bot.getInventory();
+            getDragonSpeedrunStatus(bot);
+            DragonSpeedrunStage stage = new DragonSpeedrunStage(
+                    String.valueOf(sharedState.getOrDefault("dragonSpeedrun.stage", "unknown")),
+                    String.valueOf(sharedState.getOrDefault("dragonSpeedrun.nextAction", "")),
+                    ""
+            );
+            sharedState.put("dragonSpeedrun.stage", stage.name());
+            sharedState.put("dragonSpeedrun.nextAction", stage.nextAction());
+
+            try {
+                String actionResult = executeDragonSpeedrunStage(bot, stage, inventory);
+                lastResult = actionResult;
+                logger.info("Dragon speedrun stage {} result: {}", stage.name(), actionResult);
+                if (actionResult.startsWith("WAIT:")) {
+                    ChatUtils.sendChatMessages(botSource, actionResult.substring("WAIT:".length()));
+                    break;
+                }
+                actions++;
+                Thread.sleep(350L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                lastResult = "Dragon speedrun interrupted.";
+                break;
+            } catch (Exception e) {
+                logger.error("Dragon speedrun worker failed", e);
+                lastResult = "I got stuck while trying to beat the game: " + e.getMessage();
+                ChatUtils.sendChatMessages(botSource, lastResult);
+                break;
+            }
+        }
+
+        getFunctionOutput(lastResult);
+        storeActionMemory("speedrunDragon", Map.of(
+                "stage", String.valueOf(sharedState.getOrDefault("dragonSpeedrun.stage", "unknown")),
+                "actions", String.valueOf(actions)
+        ), lastResult);
+    }
+
+    private static String executeDragonSpeedrunStage(ServerPlayer bot, DragonSpeedrunStage stage, Inventory inventory) throws Exception {
+        return switch (stage.name()) {
+            case "Overworld setup" -> executeOverworldSetupStage(bot, inventory);
+            case "Stone tools" -> executeStoneToolsStage(bot, inventory);
+            case "Iron route" -> executeResourceSearchStage(bot, "minecraft:iron_ore", "Searching for iron ore to continue the run.");
+            case "Portal prep" -> "WAIT:I need portal automation next: bucket use, water/lava pickup, and Nether portal construction. I can keep gathering blocks/tools meanwhile.";
+            case "Enter Nether" -> "WAIT:I have Nether prep, but portal building/lighting automation is not fully implemented yet.";
+            case "Blaze rods" -> "WAIT:I need Nether fortress navigation and blaze combat automation before I can collect blaze rods reliably.";
+            case "Ender pearls" -> "WAIT:I need piglin barter/enderman hunting automation before I can collect pearls reliably.";
+            case "Eyes of ender" -> executeEyesOfEnderStage(bot, inventory);
+            case "Stronghold" -> "WAIT:I need eye-of-ender throwing and stronghold navigation automation before I can enter the End like a player.";
+            case "Dragon fight prep" -> "WAIT:I need End combat automation for crystals, perches, and dragon attacks before I can finish the fight reliably.";
+            case "Dragon fight" -> "WAIT:I am geared for the dragon stage, but crystal targeting and dragon combat automation still need to be implemented.";
+            default -> "WAIT:Unknown speedrun stage: " + stage.name();
+        };
+    }
+
+    private static String executeOverworldSetupStage(ServerPlayer bot, Inventory inventory) throws Exception {
+        int logs = countItemsMatching(inventory, item -> {
+            String path = itemId(item).getPath();
+            return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
+        });
+        int planks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks"));
+        int sticks = countItemByPath(inventory, "stick");
+
+        if (logs + planks < 8) {
+            return searchMoveAndMineFirst(bot, List.of("minecraft:oak_log", "minecraft:birch_log", "minecraft:spruce_log", "minecraft:jungle_log", "minecraft:acacia_log", "minecraft:dark_oak_log", "minecraft:mangrove_log", "minecraft:cherry_log"), "wood");
+        }
+        if (planks < 8 && logs > 0) {
+            return craftItemOnServerThreadSync(bot, "oak_planks", 2);
+        }
+        if (sticks < 4) {
+            return craftItemOnServerThreadSync(bot, "stick", 1);
+        }
+        if (!hasItemByPath(inventory, "crafting_table")) {
+            return craftItemOnServerThreadSync(bot, "crafting_table", 1);
+        }
+        if (!hasItemByPath(inventory, "wooden_pickaxe")) {
+            return craftItemOnServerThreadSync(bot, "wooden_pickaxe", 1);
+        }
+        return "Overworld setup complete.";
+    }
+
+    private static String executeStoneToolsStage(ServerPlayer bot, Inventory inventory) throws Exception {
+        int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
+        if (cobble < 11) {
+            return searchMoveAndMineFirst(bot, List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate"), "stone");
+        }
+        if (!hasItemByPath(inventory, "stone_pickaxe")) {
+            return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
+        }
+        if (!hasItemByPath(inventory, "stone_sword")) {
+            return craftItemOnServerThreadSync(bot, "stone_sword", 1);
+        }
+        if (!hasItemByPath(inventory, "furnace")) {
+            return craftItemOnServerThreadSync(bot, "furnace", 1);
+        }
+        return "Stone tools complete.";
+    }
+
+    private static String executeResourceSearchStage(ServerPlayer bot, String blockType, String message) throws Exception {
+        ChatUtils.sendChatMessages(botSource, message);
+        return searchMoveAndMineFirst(bot, List.of(blockType), blockType);
+    }
+
+    private static String executeEyesOfEnderStage(ServerPlayer bot, Inventory inventory) {
+        int blazeRods = countItemByPath(inventory, "blaze_rod");
+        int enderPearls = countItemByPath(inventory, "ender_pearl");
+        if (blazeRods <= 0 || enderPearls <= 0) {
+            return "WAIT:I need blaze rods and ender pearls before I can craft eyes of ender.";
+        }
+        return "WAIT:Crafting blaze powder and eyes of ender needs recipe support added next.";
+    }
+
+    private static String searchMoveAndMineFirst(ServerPlayer bot, List<String> blockTypes, String label) throws Exception {
+        for (String blockType : blockTypes) {
+            BlockPos found = net.shasankp000.Tools.SearchBlocks.searchBlock(bot, blockType, 8, 64, 16);
+            if (found == null) {
+                continue;
+            }
+
+            BlockPos standPos = chooseInteractionPosition(bot, found);
+            String moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), true).get(120, TimeUnit.SECONDS);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                continue;
+            }
+
+            String mineResult = MiningTool.mineBlock(bot, found).get(15, TimeUnit.SECONDS);
+            return "Speedrun mined " + label + " at " + found + ": " + mineResult;
+        }
+        return "WAIT:I couldn't find nearby " + label + " yet.";
+    }
+
+    private static BlockPos chooseInteractionPosition(ServerPlayer bot, BlockPos targetPos) {
+        ServerLevel world = (ServerLevel) bot.level();
+        BlockPos currentPos = bot.blockPosition();
+        BlockPos best = currentPos;
+        int bestDistance = Integer.MAX_VALUE;
+        for (Direction direction : List.of(Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST)) {
+            int x = targetPos.getX() + direction.getStepX();
+            int z = targetPos.getZ() + direction.getStepZ();
+            int y = findStandableBuilderY(world, x, z, currentPos.getY());
+            BlockPos candidate = new BlockPos(x, y, z);
+            if (canBotOccupy(bot, new Vec3(x + 0.5, y, z + 0.5))) {
+                int distance = currentPos.distManhattan(candidate);
+                if (distance < bestDistance) {
+                    best = candidate;
+                    bestDistance = distance;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static String craftItemOnServerThreadSync(ServerPlayer bot, String itemName, int batches) throws Exception {
+        CompletableFuture<String> future = new CompletableFuture<>();
+        botSource.getServer().execute(() -> {
+            try {
+                future.complete(craftItemOnServerThread(bot, itemName, batches));
+            } catch (Exception e) {
+                future.complete("I couldn't craft " + itemName + ": " + e.getMessage());
+            }
+        });
+        return future.get(10, TimeUnit.SECONDS);
+    }
+
+    private static String getDragonSpeedrunStatus(ServerPlayer bot) {
+        Inventory inventory = bot.getInventory();
+        String dimension = bot.level().dimension().toString();
+        int logs = countItemsMatching(inventory, item -> {
+            String path = itemId(item).getPath();
+            return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
+        });
+        int planks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks"));
+        int sticks = countItemByPath(inventory, "stick");
+        int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
+        int iron = countItemByPath(inventory, "iron_ingot");
+        int blazeRods = countItemByPath(inventory, "blaze_rod");
+        int enderPearls = countItemByPath(inventory, "ender_pearl");
+        int eyes = countItemByPath(inventory, "ender_eye");
+        int arrows = countItemByPath(inventory, "arrow");
+        int food = countFoodItems(inventory);
+        int buildingBlocks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks")
+                || item == Items.COBBLESTONE
+                || item == Items.COBBLED_DEEPSLATE
+                || item == Items.DIRT);
+
+        boolean hasCraftingTable = hasItemByPath(inventory, "crafting_table");
+        boolean hasWoodPickaxe = hasItemByPath(inventory, "wooden_pickaxe");
+        boolean hasStonePickaxe = hasItemByPath(inventory, "stone_pickaxe");
+        boolean hasIronPickaxe = hasItemByPath(inventory, "iron_pickaxe");
+        boolean hasWeapon = hasItemByPath(inventory, "stone_sword")
+                || hasItemByPath(inventory, "iron_sword")
+                || hasItemByPath(inventory, "diamond_sword")
+                || hasItemByPath(inventory, "netherite_sword")
+                || hasItemByPath(inventory, "bow")
+                || hasItemByPath(inventory, "crossbow");
+        boolean hasBucket = hasItemByPath(inventory, "bucket")
+                || hasItemByPath(inventory, "water_bucket")
+                || hasItemByPath(inventory, "lava_bucket");
+        boolean hasWater = hasItemByPath(inventory, "water_bucket");
+        boolean hasLava = hasItemByPath(inventory, "lava_bucket");
+        boolean hasBow = hasItemByPath(inventory, "bow") || hasItemByPath(inventory, "crossbow");
+
+        DragonSpeedrunStage stage;
+        if (logs + planks < 8 || sticks < 4 || !hasCraftingTable || !hasWoodPickaxe) {
+            stage = new DragonSpeedrunStage(
+                    "Overworld setup",
+                    "Collect logs, craft planks/sticks/crafting table, then craft a wooden pickaxe.",
+                    "Need about 8 wood/planks, 4 sticks, crafting table, wooden pickaxe."
+            );
+        } else if (!hasStonePickaxe || cobble < 8) {
+            stage = new DragonSpeedrunStage(
+                    "Stone tools",
+                    "Mine cobblestone and craft a stone pickaxe, stone axe or sword, and furnace if needed.",
+                    "Need stone pickaxe and extra cobblestone."
+            );
+        } else if (!hasIronPickaxe && iron < 3) {
+            stage = new DragonSpeedrunStage(
+                    "Iron route",
+                    "Find iron, mine it with the stone pickaxe, smelt it, then craft bucket and iron pickaxe when possible.",
+                    "Need at least 3 iron ingots for a pickaxe, plus a bucket for portal routing."
+            );
+        } else if (!hasBucket || (!hasWater && !hasLava)) {
+            stage = new DragonSpeedrunStage(
+                    "Portal prep",
+                    "Get a bucket and find water/lava so the bot can make a player-style Nether portal route.",
+                    "Need bucket plus water or lava access."
+            );
+        } else if (!dimension.contains("nether") && blazeRods < 7) {
+            stage = new DragonSpeedrunStage(
+                    "Enter Nether",
+                    "Build and light a Nether portal like a player, then enter the Nether.",
+                    "Need Nether access before blaze rods."
+            );
+        } else if (dimension.contains("nether") && blazeRods < 7) {
+            stage = new DragonSpeedrunStage(
+                    "Blaze rods",
+                    "Find a Nether fortress, fight blazes, and collect at least 7 blaze rods.",
+                    "Need 7 blaze rods for enough blaze powder."
+            );
+        } else if (enderPearls + eyes < 12) {
+            stage = new DragonSpeedrunStage(
+                    "Ender pearls",
+                    "Trade with piglins or fight endermen until there are around 12 pearls/eyes.",
+                    "Need about 12 total pearls/eyes."
+            );
+        } else if (eyes < 12) {
+            stage = new DragonSpeedrunStage(
+                    "Eyes of ender",
+                    "Craft blaze rods into powder and combine with pearls to make eyes of ender.",
+                    "Need up to 12 eyes of ender."
+            );
+        } else if (!dimension.contains("the_end") && !dimension.endsWith(":end")) {
+            stage = new DragonSpeedrunStage(
+                    "Stronghold",
+                    "Throw eyes of ender, travel to the stronghold, fill the portal, and enter the End.",
+                    "Need stronghold navigation and portal activation."
+            );
+        } else if (!hasWeapon || (!hasBow && arrows < 16) || food < 8 || buildingBlocks < 32) {
+            stage = new DragonSpeedrunStage(
+                    "Dragon fight prep",
+                    "Gather food, blocks, and a bow/arrows or strong melee weapon before fighting.",
+                    "Need food, blocks, and ranged or strong melee gear."
+            );
+        } else {
+            stage = new DragonSpeedrunStage(
+                    "Dragon fight",
+                    "Destroy end crystals, dodge dragon attacks, use bow/melee during perches, and finish the dragon.",
+                    "Ready to fight like a normal player."
+            );
+        }
+
+        sharedState.put("dragonSpeedrun.stage", stage.name());
+        sharedState.put("dragonSpeedrun.nextAction", stage.nextAction());
+
+        return "Starting player-like Ender Dragon speedrun route. Stage: " + stage.name()
+                + ". Next: " + stage.nextAction()
+                + " " + stage.requirements()
+                + " I won't use creative, teleport-kill, or phase-through-block shortcuts.";
+    }
+
+    private static int countItemByPath(Inventory inventory, String path) {
+        return countItemsMatching(inventory, item -> itemId(item).getPath().equals(path));
+    }
+
+    private static boolean hasItemByPath(Inventory inventory, String path) {
+        return countItemByPath(inventory, path) > 0;
+    }
+
+    private static int countFoodItems(Inventory inventory) {
+        return countItemsMatching(inventory, item -> {
+            String path = itemId(item).getPath();
+            return path.contains("beef")
+                    || path.contains("porkchop")
+                    || path.contains("chicken")
+                    || path.contains("mutton")
+                    || path.contains("rabbit")
+                    || path.contains("cod")
+                    || path.contains("salmon")
+                    || path.contains("bread")
+                    || path.contains("potato")
+                    || path.contains("carrot")
+                    || path.contains("apple")
+                    || path.contains("melon")
+                    || path.contains("berries");
+        });
+    }
+
+    private static int countItemsMatching(Inventory inventory, java.util.function.Predicate<Item> matcher) {
+        int count = 0;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && matcher.test(stack.getItem())) {
+                count += stack.getCount();
+            }
+        }
+        return count;
+    }
+
+    private record DragonSpeedrunStage(String name, String nextAction, String requirements) {}
 
     private static boolean tryHandleDirectDrop(String userInput) {
         DropRequest dropRequest = parseDirectDropRequest(userInput);
@@ -1447,6 +1848,7 @@ public class FunctionCallerV2 {
         executor.submit(() -> {
             logger.info("Executing precise coordinate move from {} to {} over {} ticks", start, target, ticks);
             try {
+                rescueBotIfStuck(bot).get(2, TimeUnit.SECONDS);
                 for (int tick = 0; tick < ticks; tick++) {
                     double progress = (tick + 1) / (double) ticks;
                     Vec3 next = start.lerp(target, progress);
@@ -1531,11 +1933,82 @@ public class FunctionCallerV2 {
     }
 
     private static boolean canBotOccupy(ServerPlayer bot, Vec3 position) {
+        return canBotOccupy(bot, position, true);
+    }
+
+    private static boolean canBotOccupy(ServerPlayer bot, Vec3 position, boolean requireClearPath) {
         ServerLevel world = (ServerLevel) bot.level();
         BlockPos feet = BlockPos.containing(position.x, position.y, position.z);
+        AABB hitbox = playerHitboxAt(position);
         return isReplaceableForMovement(world, feet)
                 && isReplaceableForMovement(world, feet.above())
-                && isMovementPathClear(bot, world, bot.getEyePosition(1.0F), position.add(0.0, bot.getEyeHeight(), 0.0));
+                && hasSolidBlockBelow(world, feet)
+                && world.noCollision(bot, hitbox)
+                && (!requireClearPath || isMovementPathClear(bot, world, bot.getEyePosition(1.0F), position.add(0.0, bot.getEyeHeight(), 0.0)));
+    }
+
+    private static AABB playerHitboxAt(Vec3 position) {
+        double halfWidth = 0.3;
+        return new AABB(
+                position.x - halfWidth,
+                position.y,
+                position.z - halfWidth,
+                position.x + halfWidth,
+                position.y + 1.8,
+                position.z + halfWidth
+        );
+    }
+
+    private static CompletableFuture<Boolean> rescueBotIfStuck(ServerPlayer bot) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        MinecraftServer server = ((ServerLevel) bot.level()).getServer();
+        server.execute(() -> {
+            Vec3 current = bot.position();
+            if (canBotOccupy(bot, current)) {
+                future.complete(true);
+                return;
+            }
+
+            Optional<Vec3> safePosition = findNearestSafePosition(bot, current);
+            if (safePosition.isEmpty()) {
+                future.complete(false);
+                return;
+            }
+
+            Vec3 safe = safePosition.get();
+            bot.teleportTo(
+                    bot.level(),
+                    safe.x,
+                    safe.y,
+                    safe.z,
+                    Set.of(),
+                    bot.getYRot(),
+                    bot.getXRot(),
+                    false
+            );
+            future.complete(true);
+        });
+        return future;
+    }
+
+    private static Optional<Vec3> findNearestSafePosition(ServerPlayer bot, Vec3 origin) {
+        BlockPos base = BlockPos.containing(origin.x, origin.y, origin.z);
+        for (int radius = 0; radius <= 4; radius++) {
+            for (int dy = -2; dy <= 3; dy++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                            continue;
+                        }
+                        Vec3 candidate = new Vec3(base.getX() + dx + 0.5, base.getY() + dy, base.getZ() + dz + 0.5);
+                        if (canBotOccupy(bot, candidate, false)) {
+                            return Optional.of(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     private static boolean isReplaceableForMovement(ServerLevel world, BlockPos pos) {
@@ -1800,8 +2273,33 @@ public class FunctionCallerV2 {
             int placed = 0;
             Set<BlockPos> blueprintBlocks = new HashSet<>(blueprint);
             Set<BlockPos> temporaryPillars = Collections.synchronizedSet(new LinkedHashSet<>());
+            List<BlockPos> deferredBlocks = new ArrayList<>();
             try {
                 for (BlockPos pos : blueprint) {
+                    String placementResult = placeStructureBlockLikePlayer(bot, pos, blockId.toString(), temporaryPillars, blueprintBlocks).get(120, TimeUnit.SECONDS);
+                    if (placementResult.contains("Cannot place through blocks")) {
+                        logger.info("Deferring blocked structure block {} for a later build pass", pos);
+                        deferredBlocks.add(pos);
+                        continue;
+                    }
+                    if (placementResult.startsWith("❌") || placementResult.startsWith("⚠️")) {
+                        String failure = "I had to stop building the " + buildingType.displayName() + ": " + placementResult;
+                        getFunctionOutput(failure);
+                        ChatUtils.sendChatMessages(botSource, failure);
+                        storeActionMemory("buildStructure", Map.of(
+                                "type", buildingType.displayName(),
+                                "blockType", blockId.toString(),
+                                "x", String.valueOf(origin.getX()),
+                                "y", String.valueOf(origin.getY()),
+                                "z", String.valueOf(origin.getZ())
+                        ), failure);
+                        return;
+                    }
+                    placed++;
+                    Thread.sleep(150L);
+                }
+
+                for (BlockPos pos : deferredBlocks) {
                     String placementResult = placeStructureBlockLikePlayer(bot, pos, blockId.toString(), temporaryPillars, blueprintBlocks).get(120, TimeUnit.SECONDS);
                     if (placementResult.startsWith("❌") || placementResult.startsWith("⚠️")) {
                         String failure = "I had to stop building the " + buildingType.displayName() + ": " + placementResult;
@@ -1862,15 +2360,44 @@ public class FunctionCallerV2 {
                 }
 
                 if (!isWithinPlacementRange(bot, pos)) {
-                    String moveResult = moveNearStructureTarget(bot, pos);
+                    String moveResult = moveNearStructureTarget(bot, pos, blockId, temporaryPillars, blueprintBlocks);
                     if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
-                        return moveResult;
+                        String scaffoldResult = scaffoldAndRetryMove(bot, pos, blockId, temporaryPillars, blueprintBlocks);
+                        if (scaffoldResult.startsWith("❌") || scaffoldResult.startsWith("⚠️")) {
+                            return scaffoldResult;
+                        }
                     }
                 }
 
                 String placementResult = BlockPlacementTool.placeBlock(bot, pos, blockId).get(10, TimeUnit.SECONDS);
+                if (isAlreadyPlacedTarget(bot, pos, blockId, placementResult)) {
+                    return "✅ Target already contains " + blockId + " at " + pos;
+                }
+                if (isTooFarPlacementResult(placementResult)) {
+                    placementResult = recoverTooFarPlacement(bot, pos, blockId, temporaryPillars, blueprintBlocks, placementResult);
+                }
+                if (isAlreadyPlacedTarget(bot, pos, blockId, placementResult)) {
+                    return "✅ Target already contains " + blockId + " at " + pos;
+                }
                 if (placementResult.contains("Cannot place through blocks")) {
-                    placementResult = tryPlaceFromNearbyAngles(bot, pos, blockId, placementResult);
+                    placementResult = tryPlaceFromNearbyAngles(bot, pos, blockId, temporaryPillars, blueprintBlocks, placementResult);
+                }
+                if (isAlreadyPlacedTarget(bot, pos, blockId, placementResult)) {
+                    return "✅ Target already contains " + blockId + " at " + pos;
+                }
+                if (placementResult.contains("Cannot place through blocks") && pos.getY() > bot.blockPosition().getY()) {
+                    String pillarResult = pillarUpLikePlayer(bot, blockId, temporaryPillars, blueprintBlocks).get(10, TimeUnit.SECONDS);
+                    if (pillarResult.startsWith("❌") || pillarResult.startsWith("⚠️")) {
+                        return pillarResult;
+                    }
+                    Thread.sleep(350L);
+                    placementResult = tryPlaceFromNearbyAngles(bot, pos, blockId, temporaryPillars, blueprintBlocks, placementResult);
+                    if (placementResult.contains("Cannot place through blocks")) {
+                        placementResult = BlockPlacementTool.placeBlock(bot, pos, blockId).get(10, TimeUnit.SECONDS);
+                    }
+                    if (isAlreadyPlacedTarget(bot, pos, blockId, placementResult)) {
+                        return "✅ Target already contains " + blockId + " at " + pos;
+                    }
                 }
                 return placementResult;
             } catch (Exception e) {
@@ -1880,12 +2407,109 @@ public class FunctionCallerV2 {
         }, executor);
     }
 
-    private static String moveNearStructureTarget(ServerPlayer bot, BlockPos targetPos) throws Exception {
+    private static boolean isAlreadyPlacedTarget(ServerPlayer bot, BlockPos targetPos, String blockId, String placementResult) {
+        if (placementResult == null || !placementResult.contains("Target position is already occupied")) {
+            return false;
+        }
+
+        Identifier expectedId = Identifier.tryParse(blockId);
+        if (expectedId == null) {
+            return false;
+        }
+
+        BlockState currentState = bot.level().getBlockState(targetPos);
+        Identifier currentId = BuiltInRegistries.BLOCK.getKey(currentState.getBlock());
+        return expectedId.equals(currentId);
+    }
+
+    private static boolean isTooFarPlacementResult(String placementResult) {
+        return placementResult != null && placementResult.contains("Too far from target position");
+    }
+
+    private static String recoverTooFarPlacement(ServerPlayer bot, BlockPos targetPos, String blockId, Set<BlockPos> temporaryPillars, Set<BlockPos> blueprintBlocks, String originalResult) throws Exception {
+        removeLastTemporaryPillar(bot, temporaryPillars, blueprintBlocks, blockId);
+
+        List<BlockPos> candidates = findNearbyBuilderPositions(bot, targetPos);
+        for (BlockPos candidate : candidates) {
+            String moveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true)
+                    .get(120, TimeUnit.SECONDS);
+            logger.info("Trying closer build position {} for target {} after reach failure via {}", candidate, targetPos, moveResult);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                continue;
+            }
+
+            String scaffoldResult = pillarUpLikePlayer(bot, blockId, temporaryPillars, blueprintBlocks).get(10, TimeUnit.SECONDS);
+            if (scaffoldResult.startsWith("❌") || scaffoldResult.startsWith("⚠️")) {
+                logger.info("Could not create closer scaffold for {}: {}", targetPos, scaffoldResult);
+            } else {
+                Thread.sleep(350L);
+            }
+
+            String retryResult = BlockPlacementTool.placeBlock(bot, targetPos, blockId).get(10, TimeUnit.SECONDS);
+            if (!isTooFarPlacementResult(retryResult)) {
+                return retryResult;
+            }
+        }
+
+        return originalResult;
+    }
+
+    private static void removeLastTemporaryPillar(ServerPlayer bot, Set<BlockPos> temporaryPillars, Set<BlockPos> blueprintBlocks, String blockId) {
+        List<BlockPos> pillars = new ArrayList<>(temporaryPillars);
+        Collections.reverse(pillars);
+        for (BlockPos pillarPos : pillars) {
+            if (blueprintBlocks.contains(pillarPos)) {
+                continue;
+            }
+
+            try {
+                ServerLevel world = (ServerLevel) bot.level();
+                BlockState state = world.getBlockState(pillarPos);
+                Identifier currentBlockId = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+                if (state.isAir() || !blockId.equals(currentBlockId.toString())) {
+                    temporaryPillars.remove(pillarPos);
+                    continue;
+                }
+
+                String mineResult = MiningTool.mineBlock(bot, pillarPos).get(10, TimeUnit.SECONDS);
+                logger.info("Removed old temporary pillar {} before making closer scaffold: {}", pillarPos, mineResult);
+                temporaryPillars.remove(pillarPos);
+                return;
+            } catch (Exception e) {
+                logger.warn("Could not remove old temporary pillar {}", pillarPos, e);
+            }
+        }
+    }
+
+    private static String moveNearStructureTarget(ServerPlayer bot, BlockPos targetPos, String blockId, Set<BlockPos> temporaryPillars, Set<BlockPos> blueprintBlocks) throws Exception {
         BlockPos nearby = chooseVisibleBuilderPosition(bot, targetPos).orElseGet(() -> chooseBuilderPosition(bot, targetPos));
         String moveResult = startPreciseCoordinateMove(nearby.getX(), nearby.getY(), nearby.getZ(), true)
                 .get(120, TimeUnit.SECONDS);
         logger.info("Moved near structure placement target {} via {}", targetPos, moveResult);
         return moveResult;
+    }
+
+    private static String scaffoldAndRetryMove(ServerPlayer bot, BlockPos targetPos, String blockId, Set<BlockPos> temporaryPillars, Set<BlockPos> blueprintBlocks) throws Exception {
+        String pillarResult = pillarUpLikePlayer(bot, blockId, temporaryPillars, blueprintBlocks).get(10, TimeUnit.SECONDS);
+        if (pillarResult.startsWith("❌") || pillarResult.startsWith("⚠️")) {
+            return pillarResult;
+        }
+        Thread.sleep(350L);
+
+        List<BlockPos> candidates = findNearbyBuilderPositions(bot, targetPos);
+        for (BlockPos candidate : candidates) {
+            if (candidate.getY() < bot.blockPosition().getY()) {
+                continue;
+            }
+            String moveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true)
+                    .get(120, TimeUnit.SECONDS);
+            logger.info("Trying scaffolded build move {} for target {} via {}", candidate, targetPos, moveResult);
+            if (!moveResult.startsWith("❌") && !moveResult.startsWith("⚠️")) {
+                return moveResult;
+            }
+        }
+
+        return "✅ Scaffold placed; continuing from current position";
     }
 
     private static Optional<BlockPos> chooseVisibleBuilderPosition(ServerPlayer bot, BlockPos targetPos) {
@@ -1896,7 +2520,7 @@ public class FunctionCallerV2 {
         return Optional.empty();
     }
 
-    private static String tryPlaceFromNearbyAngles(ServerPlayer bot, BlockPos targetPos, String blockId, String originalResult) throws Exception {
+    private static String tryPlaceFromNearbyAngles(ServerPlayer bot, BlockPos targetPos, String blockId, Set<BlockPos> temporaryPillars, Set<BlockPos> blueprintBlocks, String originalResult) throws Exception {
         List<BlockPos> candidates = findVisibleBuilderPositions(bot, targetPos);
         if (candidates.isEmpty()) {
             candidates = findNearbyBuilderPositions(bot, targetPos);
@@ -1908,12 +2532,23 @@ public class FunctionCallerV2 {
                         .get(120, TimeUnit.SECONDS);
                 logger.info("Trying alternate build angle {} for target {} via {}", candidate, targetPos, moveResult);
                 if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                    String scaffoldResult = scaffoldAndRetryMove(bot, targetPos, blockId, temporaryPillars, blueprintBlocks);
+                    if (!scaffoldResult.startsWith("❌") && !scaffoldResult.startsWith("⚠️")) {
+                        moveResult = scaffoldResult;
+                    } else {
+                        logger.info("Scaffolded alternate build angle also failed for target {} via {}", targetPos, scaffoldResult);
+                    }
+                }
+                if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
                     continue;
                 }
             }
 
             String retryResult = BlockPlacementTool.placeBlock(bot, targetPos, blockId).get(10, TimeUnit.SECONDS);
-            if (!retryResult.contains("Cannot place through blocks")) {
+            if (isTooFarPlacementResult(retryResult)) {
+                retryResult = recoverTooFarPlacement(bot, targetPos, blockId, temporaryPillars, blueprintBlocks, retryResult);
+            }
+            if (!retryResult.contains("Cannot place through blocks") && !isTooFarPlacementResult(retryResult)) {
                 return retryResult;
             }
         }
@@ -1949,7 +2584,7 @@ public class FunctionCallerV2 {
                     int candidateY = findStandableBuilderY(world, candidateX, candidateZ, currentPos.getY());
                     BlockPos candidate = new BlockPos(candidateX, candidateY, candidateZ);
                     Vec3 candidatePosition = new Vec3(candidateX + 0.5, candidateY, candidateZ + 0.5);
-                    if (!canBotOccupy(bot, candidatePosition) || Math.sqrt(targetPos.distToCenterSqr(candidatePosition)) > 4.5) {
+                    if (!canBotOccupy(bot, candidatePosition) || Math.sqrt(targetPos.distToCenterSqr(candidatePosition)) > 3.75) {
                         continue;
                     }
 
@@ -2039,7 +2674,7 @@ public class FunctionCallerV2 {
 
         String result = BlockPlacementTool.placeBlock(bot, supportPos, blockId).get(10, TimeUnit.SECONDS);
         if (result.contains("Cannot place through blocks")) {
-            result = tryPlaceFromNearbyAngles(bot, supportPos, blockId, result);
+            result = tryPlaceFromNearbyAngles(bot, supportPos, blockId, temporaryPillars, blueprintBlocks, result);
         }
         return result;
     }
@@ -2118,8 +2753,7 @@ public class FunctionCallerV2 {
                     BlockPos nearby = chooseBuilderPosition(bot, pillarPos);
                     String moveResult = startPreciseCoordinateMove(nearby.getX(), nearby.getY(), nearby.getZ(), true).get(120, TimeUnit.SECONDS);
                     if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
-                        logger.warn("Skipped temporary pillar cleanup at {} because movement was blocked: {}", pillarPos, moveResult);
-                        continue;
+                        logger.warn("Cleanup movement to {} was blocked; trying to mine temporary pillar from current position: {}", pillarPos, moveResult);
                     }
                 }
 
@@ -3436,6 +4070,10 @@ public class FunctionCallerV2 {
                     int quantity = "all".equalsIgnoreCase(quantityValue) ? -1 : parseDurationSeconds(quantityValue);
                     logger.info("Calling method: dropItem with itemName={} quantity={}", itemName, quantityValue);
                     dropItem(itemName, quantity);
+                }
+                case "speedrunDragon" -> {
+                    logger.info("Calling method: speedrunDragon");
+                    startDragonSpeedrunPlan();
                 }
                 case "getOxygenLevel" -> {
                     logger.info("Calling method: getOxygenLevel");
