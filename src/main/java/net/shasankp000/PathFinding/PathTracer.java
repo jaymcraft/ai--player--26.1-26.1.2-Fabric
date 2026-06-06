@@ -274,7 +274,7 @@ public class PathTracer {
             if (finalDestination == null) return false;
 
             double distance = Math.sqrt(currentPos.distSqr(finalDestination));
-            return distance <= 2.0; // Within 2 blocks is considered "close enough"
+            return distance <= 0.75; // Coordinate navigation should not stop while still multiple blocks away.
         }
 
         private boolean tryAdvancedSegmentSkip(BlockPos currentPos) {

@@ -375,14 +375,13 @@ public class FunctionCallerV2 {
         /** goTo tool: path finder + tracer **/
         private static void goTo(int x, int y, int z, boolean sprint) {
             System.out.println("Going to coordinates: " + x + ", " + y + ", " + z + " | Sprint: " + sprint);
-            if (botSource == null) {
+            if (botSource == null || botSource.getPlayer() == null) {
                 System.out.println("Bot not found.");
                 getFunctionOutput("Bot not found.");
                 return;
             }
             try {
-                // ✅ Call the method and wait for result
-                String result = GoTo.goTo(botSource, x, y, z, sprint);
+                String result = startPreciseCoordinateMove(x, y, z, sprint).get(120, TimeUnit.SECONDS);
                 // ✅ Ensure we have a valid result for parsing
                 if (result == null || result.trim().isEmpty()) {
                     // Fallback: get current bot position
@@ -1428,9 +1427,84 @@ public class FunctionCallerV2 {
         }
 
         return new DropRequest(itemName, quantity);
-    }
+        }
 
-    private record DropRequest(String itemName, int quantity) {}
+        private record DropRequest(String itemName, int quantity) {}
+
+    private static CompletableFuture<String> startPreciseCoordinateMove(int x, int y, int z, boolean sprint) {
+        CompletableFuture<String> future = new CompletableFuture<>();
+        MinecraftServer server = botSource.getServer();
+        ServerPlayer bot = botSource.getPlayer();
+        Vec3 start = bot.position();
+        Vec3 target = new Vec3(x + 0.5, y, z + 0.5);
+        double distance = start.distanceTo(target);
+        double blocksPerSecond = sprint ? 5.612 : 4.317;
+        int ticks = Math.max(1, Math.min(2400, (int) Math.ceil((distance / blocksPerSecond) * 20.0)));
+
+        AutoFaceEntity.isBotMoving = true;
+        AutoFaceEntity.setBotExecutingTask(true);
+
+        executor.submit(() -> {
+            logger.info("Executing precise coordinate move from {} to {} over {} ticks", start, target, ticks);
+            try {
+                for (int tick = 0; tick < ticks; tick++) {
+                    double progress = (tick + 1) / (double) ticks;
+                    Vec3 next = start.lerp(target, progress);
+                    server.execute(() -> bot.teleportTo(
+                            bot.level(),
+                            next.x,
+                            next.y,
+                            next.z,
+                            Set.of(),
+                            bot.getYRot(),
+                            bot.getXRot(),
+                            false
+                    ));
+                    Thread.sleep(50L);
+                }
+
+                server.execute(() -> {
+                    bot.teleportTo(
+                            bot.level(),
+                            target.x,
+                            target.y,
+                            target.z,
+                            Set.of(),
+                            bot.getYRot(),
+                            bot.getXRot(),
+                            false
+                    );
+                    AutoFaceEntity.isBotMoving = false;
+                    AutoFaceEntity.setBotExecutingTask(false);
+                    BlockPos pos = bot.blockPosition();
+                    String result = String.format("Bot moved to position - x: %d y: %d z: %d",
+                            pos.getX(), pos.getY(), pos.getZ());
+                    storeActionMemory("goTo", Map.of(
+                            "x", String.valueOf(x),
+                            "y", String.valueOf(y),
+                            "z", String.valueOf(z),
+                            "sprint", String.valueOf(sprint)
+                    ), result);
+                    future.complete(result);
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                server.execute(() -> {
+                    AutoFaceEntity.isBotMoving = false;
+                    AutoFaceEntity.setBotExecutingTask(false);
+                });
+                future.completeExceptionally(e);
+            } catch (Exception e) {
+                server.execute(() -> {
+                    AutoFaceEntity.isBotMoving = false;
+                    AutoFaceEntity.setBotExecutingTask(false);
+                });
+                future.completeExceptionally(e);
+            }
+        });
+
+        return future;
+    }
 
     private static boolean tryHandleDirectCraft(String userInput) {
         if (!isCraftRequest(userInput)) {
@@ -2875,7 +2949,9 @@ public class FunctionCallerV2 {
         };
 
         MinecraftServer functionServer = botSource != null ? botSource.getServer() : null;
-        if (functionServer != null && functionServer.isSameThread()) {
+        if ("goTo".equals(functionName)) {
+            executor.submit(task);
+        } else if (functionServer != null && functionServer.isSameThread()) {
             task.run();
         } else if (functionServer != null) {
             functionServer.execute(task);
