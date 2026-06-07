@@ -125,7 +125,7 @@ public class BlockPlacementTool {
                         placementDirection.getOpposite().getStepZ() * 0.5
                 );
 
-                if (!hasLineOfSightToPlacementFace(world, bot, adjacentPos, hitVec)) {
+                if (!hasLineOfSightToPlacementFace(world, bot, adjacentPos, hitVec, placementDirection.getOpposite())) {
                     String error = "❌ Cannot place through blocks at " + targetPos;
                     LOGGER.warn(error);
                     return error;
@@ -281,7 +281,7 @@ public class BlockPlacementTool {
                         direction.getOpposite().getStepY() * 0.5,
                         direction.getOpposite().getStepZ() * 0.5
                 );
-                if (hasLineOfSightToPlacementFace(world, bot, adjacentPos, hitVec)) {
+                if (hasLineOfSightToPlacementFace(world, bot, adjacentPos, hitVec, direction.getOpposite())) {
                     return direction;
                 }
             }
@@ -300,15 +300,19 @@ public class BlockPlacementTool {
         return false;
     }
 
-    private static boolean hasLineOfSightToPlacementFace(Level world, ServerPlayer bot, BlockPos adjacentPos, Vec3 hitVec) {
+    private static boolean hasLineOfSightToPlacementFace(Level world, ServerPlayer bot, BlockPos adjacentPos, Vec3 hitVec, Direction clickedFace) {
+        Vec3 endInsideClickedBlock = hitVec.add(
+                clickedFace.getStepX() * -0.01,
+                clickedFace.getStepY() * -0.01,
+                clickedFace.getStepZ() * -0.01
+        );
         BlockHitResult lineOfSight = world.clip(new ClipContext(
                 bot.getEyePosition(1.0F),
-                hitVec,
+                endInsideClickedBlock,
                 ClipContext.Block.COLLIDER,
                 ClipContext.Fluid.NONE,
                 bot
         ));
-        return lineOfSight.getType() == HitResult.Type.MISS
-                || (lineOfSight.getType() == HitResult.Type.BLOCK && lineOfSight.getBlockPos().equals(adjacentPos));
+        return lineOfSight.getType() == HitResult.Type.BLOCK && lineOfSight.getBlockPos().equals(adjacentPos);
     }
 }
