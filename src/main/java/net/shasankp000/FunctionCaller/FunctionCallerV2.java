@@ -115,6 +115,8 @@ public class FunctionCallerV2 {
             "a", "an", "the", "some", "one", "me", "for", "please", "item", "items", "batch", "batches"
     );
 
+    private record MiningTarget(BlockPos blockPos, BlockPos standPos) {}
+
     // Markov Planner components (initialized on first use)
     private static Planner planner = null;
     private static ActionLogWriter actionLogWriter = null;
@@ -1533,7 +1535,7 @@ public class FunctionCallerV2 {
         return switch (stage.name()) {
             case "Overworld setup" -> executeOverworldSetupStage(bot, inventory);
             case "Stone tools" -> executeStoneToolsStage(bot, inventory);
-            case "Iron route" -> executeResourceSearchStage(bot, "minecraft:iron_ore", "Searching for iron ore to continue the run.");
+            case "Iron route" -> executeIronRouteStage(bot, inventory);
             case "Portal prep" -> "WAIT:I need portal automation next: bucket use, water/lava pickup, and Nether portal construction. I can keep gathering blocks/tools meanwhile.";
             case "Enter Nether" -> "WAIT:I have Nether prep, but portal building/lighting automation is not fully implemented yet.";
             case "Blaze rods" -> "WAIT:I need Nether fortress navigation and blaze combat automation before I can collect blaze rods reliably.";
@@ -1597,6 +1599,137 @@ public class FunctionCallerV2 {
         return "Stone tools complete.";
     }
 
+    private static String executeIronRouteStage(ServerPlayer bot, Inventory inventory) throws Exception {
+        ChatUtils.sendChatMessages(botSource, "Searching for iron ore and mining a tunnel toward it if needed.");
+        String exposedResult = searchMoveAndMineFirst(bot, List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore"), "iron ore");
+        if (!exposedResult.startsWith("WAIT:")) {
+            return exposedResult;
+        }
+
+        return tunnelToAndMineOre(bot, inventory, List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore"), "iron ore");
+    }
+
+    private static String tunnelToAndMineOre(ServerPlayer bot, Inventory inventory, List<String> oreTypes, String label) throws Exception {
+        List<BlockPos> oreCandidates = findNearestBlocks(bot, oreTypes, 48, 48, 16);
+        if (oreCandidates.isEmpty()) {
+            return "WAIT:I couldn't find nearby " + label + " yet.";
+        }
+
+        for (BlockPos orePos : oreCandidates) {
+            String tunnelResult = mineTunnelTowardBlock(bot, orePos, oreTypes, 80);
+            if (tunnelResult.startsWith("❌") || tunnelResult.startsWith("⚠️")) {
+                logger.info("Could not tunnel to {} at {} via {}", label, orePos, tunnelResult);
+                continue;
+            }
+
+            if (!isWithinPlacementRange(bot, orePos)) {
+                String moveResult = moveToInteractionPosition(bot, orePos);
+                if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                    continue;
+                }
+            }
+
+            if (!isAnyBlockType((ServerLevel) bot.level(), orePos, oreTypes)) {
+                continue;
+            }
+
+            int beforeOre = countItemsMatching(inventory, item -> {
+                String path = itemId(item).getPath();
+                return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
+            });
+            String mineResult = MiningTool.mineBlock(bot, orePos).get(20, TimeUnit.SECONDS);
+            collectNearbyDroppedItems(bot, List.of("minecraft:raw_iron", "minecraft:iron_ore", "minecraft:deepslate_iron_ore"), orePos, 5.0);
+            Thread.sleep(500L);
+            int afterOre = countItemsMatching(inventory, item -> {
+                String path = itemId(item).getPath();
+                return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
+            });
+            return "Speedrun tunneled to " + label + " at " + orePos + " and mined it. Collected +"
+                    + Math.max(0, afterOre - beforeOre) + " iron drops. Last result: " + mineResult;
+        }
+
+        return "WAIT:I found " + label + ", but couldn't mine a safe tunnel to it yet.";
+    }
+
+    private static String mineTunnelTowardBlock(ServerPlayer bot, BlockPos targetPos, List<String> targetBlockTypes, int maxSteps) throws Exception {
+        ServerLevel world = (ServerLevel) bot.level();
+        String lastMineResult = "No tunnel block mined yet.";
+        for (int step = 0; step < maxSteps; step++) {
+            BlockPos feet = bot.blockPosition();
+            if (Math.sqrt(targetPos.distToCenterSqr(bot.position())) <= 4.0 && canSeeBlock(world, bot, targetPos)) {
+                return "✅ Reached visible " + targetPos;
+            }
+
+            BlockPos nextFeet = nextTunnelStep(feet, targetPos);
+            if (nextFeet.getY() <= world.getMinY() + 1) {
+                return "⚠️ Tunnel would go too deep near " + nextFeet;
+            }
+
+            for (BlockPos clearPos : List.of(nextFeet, nextFeet.above())) {
+                BlockState clearState = world.getBlockState(clearPos);
+                if (!clearState.isAir() && !clearState.canBeReplaced()) {
+                    if (!clearState.getFluidState().isEmpty()) {
+                        return "⚠️ Tunnel hit fluid at " + clearPos;
+                    }
+                    lastMineResult = MiningTool.mineBlock(bot, clearPos).get(20, TimeUnit.SECONDS);
+                    if (lastMineResult.startsWith("❌") || lastMineResult.startsWith("⚠️")) {
+                        return lastMineResult;
+                    }
+                    Thread.sleep(250L);
+                }
+            }
+
+            BlockState floorState = world.getBlockState(nextFeet.below());
+            if (floorState.isAir() || !floorState.getFluidState().isEmpty()) {
+                return "⚠️ Tunnel step is unsafe because there is no solid floor at " + nextFeet.below();
+            }
+
+            Vec3 nextPosition = new Vec3(nextFeet.getX() + 0.5, nextFeet.getY(), nextFeet.getZ() + 0.5);
+            if (!canBotOccupy(bot, nextPosition, false)) {
+                return "⚠️ Tunnel step is not occupiable at " + nextFeet;
+            }
+
+            String moveResult = startPreciseCoordinateMove(nextFeet.getX(), nextFeet.getY(), nextFeet.getZ(), false, false).get(30, TimeUnit.SECONDS);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                return moveResult;
+            }
+
+            if (isAnyBlockType(world, targetPos, targetBlockTypes)
+                    && Math.sqrt(targetPos.distToCenterSqr(bot.position())) <= 4.0
+                    && canSeeBlock(world, bot, targetPos)) {
+                return "✅ Tunneled into range of " + targetPos;
+            }
+        }
+
+        return "⚠️ Tunnel step limit reached. Last mined: " + lastMineResult;
+    }
+
+    private static BlockPos nextTunnelStep(BlockPos currentFeet, BlockPos targetPos) {
+        int dx = targetPos.getX() - currentFeet.getX();
+        int dy = targetPos.getY() - currentFeet.getY();
+        int dz = targetPos.getZ() - currentFeet.getZ();
+
+        if (Math.abs(dx) >= Math.abs(dz) && Math.abs(dx) > 1) {
+            return currentFeet.offset(Integer.compare(dx, 0), 0, 0);
+        }
+        if (Math.abs(dz) > 1) {
+            return currentFeet.offset(0, 0, Integer.compare(dz, 0));
+        }
+        if (dy < -1) {
+            return currentFeet.below();
+        }
+        if (dy > 1) {
+            return currentFeet.above();
+        }
+        if (Math.abs(dx) > 0) {
+            return currentFeet.offset(Integer.compare(dx, 0), 0, 0);
+        }
+        if (Math.abs(dz) > 0) {
+            return currentFeet.offset(0, 0, Integer.compare(dz, 0));
+        }
+        return currentFeet;
+    }
+
     private static String mineDownForStone(ServerPlayer bot, Inventory inventory, int neededCobble) throws Exception {
         List<String> stoneBlocks = List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate");
         List<String> cobbleItems = List.of("minecraft:cobblestone", "minecraft:cobbled_deepslate");
@@ -1627,7 +1760,7 @@ public class FunctionCallerV2 {
             BlockPos loweredFeet = below;
             Vec3 loweredPosition = new Vec3(loweredFeet.getX() + 0.5, loweredFeet.getY(), loweredFeet.getZ() + 0.5);
             if (canBotOccupy(bot, loweredPosition, false)) {
-                startPreciseCoordinateMove(loweredFeet.getX(), loweredFeet.getY(), loweredFeet.getZ(), false).get(30, TimeUnit.SECONDS);
+                startPreciseCoordinateMove(loweredFeet.getX(), loweredFeet.getY(), loweredFeet.getZ(), false, false).get(30, TimeUnit.SECONDS);
             }
 
             if (isStone) {
@@ -1782,14 +1915,13 @@ public class FunctionCallerV2 {
                     logger.info("Could not mine tree log {} via {}", treeLog, lastMineResult);
                     continue;
                 }
-                collectNearbyDroppedItems(bot, logTypes, treeLog, 4.0);
                 mined++;
-                Thread.sleep(450L);
+                Thread.sleep(150L);
             }
         }
 
         collectNearbyDroppedItems(bot, logTypes, bot.blockPosition(), 8.0);
-        Thread.sleep(1000L);
+        Thread.sleep(250L);
         int afterLogs = countItemsMatching(inventory, item -> {
             String path = itemId(item).getPath();
             return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
@@ -1824,7 +1956,7 @@ public class FunctionCallerV2 {
         });
 
         droppedItems.sort(Comparator.comparingDouble(itemEntity -> itemEntity.distanceToSqr(bot)));
-        int pickups = Math.min(droppedItems.size(), 8);
+        int pickups = Math.min(droppedItems.size(), 4);
         for (int i = 0; i < pickups; i++) {
             ItemEntity droppedItem = droppedItems.get(i);
             if (!droppedItem.isAlive()) {
@@ -1832,13 +1964,20 @@ public class FunctionCallerV2 {
             }
 
             BlockPos itemPos = droppedItem.blockPosition();
-            String moveResult = startPreciseCoordinateMove(itemPos.getX(), itemPos.getY(), itemPos.getZ(), false).get(30, TimeUnit.SECONDS);
-            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
-                BlockPos standPos = findStandablePickupPosition(bot, itemPos);
-                moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), false).get(30, TimeUnit.SECONDS);
+            if (droppedItem.distanceToSqr(bot) <= 2.25) {
+                Thread.sleep(100L);
+                continue;
             }
+
+            BlockPos standPos = findStandablePickupPosition(bot, itemPos);
+            if (standPos.equals(bot.blockPosition()) && droppedItem.distanceToSqr(bot) > 6.25) {
+                logger.info("Skipping dropped speedrun item at {} because no nearby pickup position is reachable", itemPos);
+                continue;
+            }
+
+            String moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), false, false).get(4, TimeUnit.SECONDS);
             logger.info("Collecting dropped speedrun item at {} via {}", itemPos, moveResult);
-            Thread.sleep(300L);
+            Thread.sleep(100L);
         }
     }
 
@@ -1921,6 +2060,34 @@ public class FunctionCallerV2 {
         return false;
     }
 
+    private static boolean canSeeBlock(ServerLevel world, ServerPlayer bot, BlockPos targetPos) {
+        Vec3 eyePosition = bot.getEyePosition(1.0F);
+        for (Direction direction : Direction.values()) {
+            Vec3 faceCenter = Vec3.atCenterOf(targetPos).add(
+                    direction.getStepX() * 0.5,
+                    direction.getStepY() * 0.5,
+                    direction.getStepZ() * 0.5
+            );
+            Vec3 endInsideTarget = faceCenter.add(
+                    direction.getStepX() * -0.01,
+                    direction.getStepY() * -0.01,
+                    direction.getStepZ() * -0.01
+            );
+            net.minecraft.world.phys.BlockHitResult lineOfSight = world.clip(new net.minecraft.world.level.ClipContext(
+                    eyePosition,
+                    endInsideTarget,
+                    net.minecraft.world.level.ClipContext.Block.COLLIDER,
+                    net.minecraft.world.level.ClipContext.Fluid.NONE,
+                    bot
+            ));
+            if (lineOfSight.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK
+                    && lineOfSight.getBlockPos().equals(targetPos)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String moveToInteractionPosition(ServerPlayer bot, BlockPos targetPos) throws Exception {
         List<BlockPos> candidates = findInteractionPositions(bot, targetPos);
         if (candidates.isEmpty()) {
@@ -1929,14 +2096,15 @@ public class FunctionCallerV2 {
 
         String lastMoveResult = "❌ No interaction move attempted";
         for (BlockPos candidate : candidates) {
-            lastMoveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true).get(120, TimeUnit.SECONDS);
+            lastMoveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true, false).get(120, TimeUnit.SECONDS);
             if (!lastMoveResult.startsWith("❌") && !lastMoveResult.startsWith("⚠️")) {
                 return lastMoveResult;
             }
 
-            String pathResult = GoTo.goTo(botSource, candidate.getX(), candidate.getY(), candidate.getZ(), true);
+            String pathResult = GoTo.goTo(botSource, candidate.getX(), candidate.getY(), candidate.getZ(), true, 12);
             if (!pathResult.startsWith("Failed")
                     && !pathResult.startsWith("Error")
+                    && !pathResult.startsWith("⚠️")
                     && bot.blockPosition().distManhattan(candidate) <= 2) {
                 return pathResult;
             }
@@ -2212,6 +2380,10 @@ public class FunctionCallerV2 {
         private record DropRequest(String itemName, int quantity) {}
 
     private static CompletableFuture<String> startPreciseCoordinateMove(int x, int y, int z, boolean sprint) {
+        return startPreciseCoordinateMove(x, y, z, sprint, true);
+    }
+
+    private static CompletableFuture<String> startPreciseCoordinateMove(int x, int y, int z, boolean sprint, boolean recordMemory) {
         CompletableFuture<String> future = new CompletableFuture<>();
         MinecraftServer server = botSource.getServer();
         ServerPlayer bot = botSource.getPlayer();
@@ -2284,12 +2456,14 @@ public class FunctionCallerV2 {
                     BlockPos pos = bot.blockPosition();
                     String result = String.format("Bot moved to position - x: %d y: %d z: %d",
                             pos.getX(), pos.getY(), pos.getZ());
-                    storeActionMemory("goTo", Map.of(
-                            "x", String.valueOf(x),
-                            "y", String.valueOf(y),
-                            "z", String.valueOf(z),
-                            "sprint", String.valueOf(sprint)
-                    ), result);
+                    if (recordMemory) {
+                        storeActionMemory("goTo", Map.of(
+                                "x", String.valueOf(x),
+                                "y", String.valueOf(y),
+                                "z", String.valueOf(z),
+                                "sprint", String.valueOf(sprint)
+                        ), result);
+                    }
                     future.complete(result);
                 });
             } catch (InterruptedException e) {
@@ -3000,9 +3174,10 @@ public class FunctionCallerV2 {
         }
 
         if (Math.abs(targetPos.getY() - currentPos.getY()) <= 1) {
-            String pathResult = GoTo.goTo(botSource, targetPos.getX(), targetPos.getY(), targetPos.getZ(), true);
+            String pathResult = GoTo.goTo(botSource, targetPos.getX(), targetPos.getY(), targetPos.getZ(), true, 8);
             if (!pathResult.startsWith("Failed")
                     && !pathResult.startsWith("Error")
+                    && !pathResult.startsWith("⚠️")
                     && bot.blockPosition().distManhattan(targetPos) <= 2) {
                 return pathResult;
             }
@@ -4466,7 +4641,7 @@ public class FunctionCallerV2 {
             case "mineBlock" -> {
                 if (output.contains("Mining complete!")) {
                     values.add("success");
-                } else if (output.contains("⚠️ Failed to mine block")) {
+                } else if (output.contains("⚠️ Failed to mine block") || output.contains("Cannot mine")) {
                     values.add("failed");
                 }
             }
@@ -4828,14 +5003,45 @@ public class FunctionCallerV2 {
 
                         // Store result in SharedState for next steps
                         if (result != null) {
-                            SharedStateUtils.setValue(state, "found_block_x", result.getX());
-                            SharedStateUtils.setValue(state, "found_block_y", result.getY());
-                            SharedStateUtils.setValue(state, "found_block_z", result.getZ());
+                            MiningTarget miningTarget = resolveReachableMiningTarget(bot, result, blockType);
+                            if (miningTarget == null) {
+                                SharedStateUtils.setValue(state, "search_success", false);
+                                getFunctionOutput(String.format("Found %s at (%d, %d, %d), but no reachable standing spot was available",
+                                        blockType, result.getX(), result.getY(), result.getZ()));
+                                logger.warn("searchBlocks found {} at ({}, {}, {}) but could not resolve a reachable mining stand position",
+                                        blockType, result.getX(), result.getY(), result.getZ());
+                                break;
+                            }
+
+                            BlockPos blockPos = miningTarget.blockPos();
+                            BlockPos standPos = miningTarget.standPos();
+                            SharedStateUtils.setValue(state, "found_block_x", blockPos.getX());
+                            SharedStateUtils.setValue(state, "found_block_y", blockPos.getY());
+                            SharedStateUtils.setValue(state, "found_block_z", blockPos.getZ());
                             SharedStateUtils.setValue(state, "found_block_type", blockType);
+                            SharedStateUtils.setValue(state, "mining_stand_x", standPos.getX());
+                            SharedStateUtils.setValue(state, "mining_stand_y", standPos.getY());
+                            SharedStateUtils.setValue(state, "mining_stand_z", standPos.getZ());
                             SharedStateUtils.setValue(state, "search_success", true);
-                            logger.info("✓ searchBlocks found {} at ({}, {}, {})", blockType, result.getX(), result.getY(), result.getZ());
+                            getFunctionOutput(String.format("Found reachable %s at x: %d y: %d z: %d; stand at x: %d y: %d z: %d",
+                                    blockType,
+                                    blockPos.getX(),
+                                    blockPos.getY(),
+                                    blockPos.getZ(),
+                                    standPos.getX(),
+                                    standPos.getY(),
+                                    standPos.getZ()));
+                            logger.info("✓ searchBlocks found reachable {} at ({}, {}, {}), stand at ({}, {}, {})",
+                                    blockType,
+                                    blockPos.getX(),
+                                    blockPos.getY(),
+                                    blockPos.getZ(),
+                                    standPos.getX(),
+                                    standPos.getY(),
+                                    standPos.getZ());
                         } else {
                             SharedStateUtils.setValue(state, "search_success", false);
+                            getFunctionOutput(String.format("No %s found within %d blocks", blockType, maxRadius));
                             logger.warn("searchBlocks did not find {} within radius {}", blockType, maxRadius);
                         }
                     } else {
@@ -4847,6 +5053,92 @@ public class FunctionCallerV2 {
 
             logger.info("✓ Function {} execution completed", functionName);
             storeActionMemory(functionName, paramMap, functionOutput);
+    }
+
+    private static MiningTarget resolveReachableMiningTarget(ServerPlayer bot, BlockPos foundBlock, String blockType) {
+        List<BlockPos> candidates = new ArrayList<>();
+        ServerLevel world = (ServerLevel) bot.level();
+
+        for (int y = foundBlock.getY(); y >= foundBlock.getY() - 5; y--) {
+            candidates.add(new BlockPos(foundBlock.getX(), y, foundBlock.getZ()));
+        }
+        for (int y = foundBlock.getY() + 1; y <= foundBlock.getY() + 2; y++) {
+            candidates.add(new BlockPos(foundBlock.getX(), y, foundBlock.getZ()));
+        }
+
+        int radius = 4;
+        for (int x = -radius; x <= radius; x++) {
+            for (int y = -radius; y <= radius; y++) {
+                for (int z = -radius; z <= radius; z++) {
+                    BlockPos candidate = foundBlock.offset(x, y, z);
+                    if (candidate.distManhattan(foundBlock) <= radius * 2) {
+                        candidates.add(candidate);
+                    }
+                }
+            }
+        }
+
+        candidates.sort(Comparator
+                .comparingInt((BlockPos pos) -> Math.abs(pos.getX() - foundBlock.getX()) + Math.abs(pos.getZ() - foundBlock.getZ()))
+                .thenComparingInt(pos -> Math.abs(pos.getY() - bot.blockPosition().getY()))
+                .thenComparingDouble(pos -> pos.distSqr(bot.blockPosition())));
+
+        Set<BlockPos> seen = new HashSet<>();
+        for (BlockPos candidate : candidates) {
+            if (!seen.add(candidate) || !matchesBlockType(world, candidate, blockType)) {
+                continue;
+            }
+
+            BlockPos standPos = findMiningStandPos(bot, candidate);
+            if (standPos != null) {
+                return new MiningTarget(candidate, standPos);
+            }
+        }
+
+        return null;
+    }
+
+    private static BlockPos findMiningStandPos(ServerPlayer bot, BlockPos targetBlock) {
+        List<BlockPos> candidates = new ArrayList<>();
+        Direction[] horizontalDirections = {Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST};
+        int botY = bot.blockPosition().getY();
+
+        for (int y = Math.max(botY + 2, targetBlock.getY() + 1); y >= Math.min(botY - 3, targetBlock.getY() - 5); y--) {
+            for (Direction direction : horizontalDirections) {
+                candidates.add(targetBlock.relative(direction).atY(y));
+            }
+        }
+
+        candidates.sort(Comparator.comparingDouble(pos -> pos.distSqr(bot.blockPosition())));
+
+        for (BlockPos candidate : candidates) {
+            Vec3 standCenter = Vec3.atBottomCenterOf(candidate);
+            if (targetBlock.distToCenterSqr(standCenter) <= 25.0 && canBotOccupy(bot, standCenter, false)) {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static boolean matchesBlockType(ServerLevel world, BlockPos pos, String blockType) {
+        BlockState state = world.getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+
+        try {
+            Identifier id = Identifier.parse(normalizeBlockType(blockType));
+            return BuiltInRegistries.BLOCK.getKey(state.getBlock()).equals(id);
+        } catch (Exception e) {
+            logger.warn("Unable to compare block type '{}': {}", blockType, e.getMessage());
+            return false;
+        }
+    }
+
+    private static String normalizeBlockType(String blockType) {
+        String normalized = blockType == null ? "" : blockType.trim().toLowerCase(Locale.ROOT);
+        return normalized.contains(":") ? normalized : "minecraft:" + normalized;
     }
 
     private static int parseDurationSeconds(String value) {
@@ -5024,13 +5316,16 @@ public class FunctionCallerV2 {
                     int blockX = (int) SharedStateUtils.getValue(state, "found_block_x");
                     int blockY = (int) SharedStateUtils.getValue(state, "found_block_y");
                     int blockZ = (int) SharedStateUtils.getValue(state, "found_block_z");
+                    Integer standX = (Integer) SharedStateUtils.getValue(state, "mining_stand_x");
+                    Integer standY = (Integer) SharedStateUtils.getValue(state, "mining_stand_y");
+                    Integer standZ = (Integer) SharedStateUtils.getValue(state, "mining_stand_z");
 
-                    // Navigate to adjacent position (not ON the block)
-                    params.put("x", String.valueOf(blockX + 1));
-                    params.put("y", String.valueOf(blockY));
-                    params.put("z", String.valueOf(blockZ));
+                    params.put("x", String.valueOf(standX != null ? standX : blockX + 1));
+                    params.put("y", String.valueOf(standY != null ? standY : blockY));
+                    params.put("z", String.valueOf(standZ != null ? standZ : blockZ));
                     params.put("sprint", "true");
-                    logger.info("🔗 Resolved goTo params from SharedState: ({}, {}, {})", blockX+1, blockY, blockZ);
+                    logger.info("🔗 Resolved goTo params from SharedState: ({}, {}, {})",
+                            params.get("x"), params.get("y"), params.get("z"));
                 } else if (paramArray.length >= 3) {
                     params.put("x", paramArray[0]);
                     params.put("y", paramArray[1]);
@@ -5141,11 +5436,15 @@ public class FunctionCallerV2 {
                 // Verify goTo moved the bot close to the target
                 Integer targetX = (Integer) SharedStateUtils.getValue(sharedState, "found_block_x");
                 Integer targetZ = (Integer) SharedStateUtils.getValue(sharedState, "found_block_z");
+                Integer standX = (Integer) SharedStateUtils.getValue(sharedState, "mining_stand_x");
+                Integer standZ = (Integer) SharedStateUtils.getValue(sharedState, "mining_stand_z");
 
                 if (targetX != null && targetZ != null && botSource != null && botSource.getPlayer() != null) {
                     BlockPos botPos = botSource.getPlayer().blockPosition();
-                    double distance = Math.sqrt(Math.pow(botPos.getX() - (targetX + 1), 2) +
-                                               Math.pow(botPos.getZ() - targetZ, 2));
+                    int expectedX = standX != null ? standX : targetX + 1;
+                    int expectedZ = standZ != null ? standZ : targetZ;
+                    double distance = Math.sqrt(Math.pow(botPos.getX() - expectedX, 2) +
+                                               Math.pow(botPos.getZ() - expectedZ, 2));
 
                     if (distance <= 3.0) { // Within 3 blocks is good enough
                         logger.info("✓ goTo verification: bot within {} blocks of target", String.format("%.1f", distance));
@@ -5167,14 +5466,14 @@ public class FunctionCallerV2 {
                 Integer blockZ = (Integer) SharedStateUtils.getValue(sharedState, "found_block_z");
 
                 if (blockX != null && blockY != null && blockZ != null && botSource != null) {
-                    MinecraftServer server = botSource.getServer();
-                    if (server != null) {
-                        ServerLevel world = server.overworld();
+                    ServerPlayer bot = botSource.getPlayer();
+                    if (bot != null) {
+                        ServerLevel world = (ServerLevel) bot.level();
                         BlockPos blockPos = new BlockPos(blockX, blockY, blockZ);
-                        Block block = world.getBlockState(blockPos).getBlock();
+                        BlockState blockState = world.getBlockState(blockPos);
 
                         // Check if block is now air (successfully mined)
-                        if (block == Blocks.AIR) {
+                        if (blockState.isAir()) {
                             logger.info("✓ mineBlock verification: block successfully removed");
                             return true;
                         } else {

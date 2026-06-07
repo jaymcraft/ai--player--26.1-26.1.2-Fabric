@@ -4,6 +4,7 @@ import java.util.concurrent.*;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
@@ -19,6 +20,8 @@ public class MiningTool {
 
     private static final long ATTACK_INTERVAL_MS = 200;
     private static final double MAX_MINING_DISTANCE = 5.0;
+    private static final int MAX_LEAF_OBSTRUCTIONS_TO_CLEAR = 4;
+    private static final long LEAF_CLEAR_TIMEOUT_MS = 1200;
     public static final Logger LOGGER = LoggerFactory.getLogger("mining-tool");
 
     public static CompletableFuture<String> mineBlock(ServerPlayer bot, BlockPos targetBlockPos) {
@@ -30,6 +33,8 @@ public class MiningTool {
 
                 // Step 1: Face the block
                 LookController.faceBlock(bot, targetBlockPos);
+
+                clearLeafObstructions(bot, targetBlockPos);
 
                 if (!canReachVisibleBlock(bot, targetBlockPos)) {
                     miningResult.complete("❌ Cannot mine through blocks at " + targetBlockPos);
@@ -56,11 +61,14 @@ public class MiningTool {
                     }
 
                     if (!canReachVisibleBlock(bot, targetBlockPos)) {
-                        String error = "❌ Cannot mine through blocks at " + targetBlockPos;
-                        LOGGER.warn(error);
-                        miningResult.complete(error);
-                        miningExecutor.shutdownNow();
-                        return;
+                        clearLeafObstructions(bot, targetBlockPos);
+                        if (!canReachVisibleBlock(bot, targetBlockPos)) {
+                            String error = "❌ Cannot mine through blocks at " + targetBlockPos;
+                            LOGGER.warn(error);
+                            miningResult.complete(error);
+                            miningExecutor.shutdownNow();
+                            return;
+                        }
                     }
 
                     bot.swing(bot.getUsedItemHand());
@@ -86,6 +94,82 @@ public class MiningTool {
         }
 
         return miningResult;
+    }
+
+    private static void clearLeafObstructions(ServerPlayer bot, BlockPos targetBlockPos) {
+        for (int attempts = 0; attempts < MAX_LEAF_OBSTRUCTIONS_TO_CLEAR; attempts++) {
+            if (canReachVisibleBlock(bot, targetBlockPos)) {
+                return;
+            }
+
+            BlockPos leafPos = findLeafObstruction(bot, targetBlockPos);
+            if (leafPos == null) {
+                return;
+            }
+
+            LOGGER.info("Clearing leaf obstruction {} before mining {}", leafPos, targetBlockPos);
+            mineObstruction(bot, leafPos);
+            LookController.faceBlock(bot, targetBlockPos);
+        }
+    }
+
+    private static BlockPos findLeafObstruction(ServerPlayer bot, BlockPos targetBlockPos) {
+        Level world = bot.level();
+        for (Direction direction : Direction.values()) {
+            Vec3 faceCenter = Vec3.atCenterOf(targetBlockPos).add(
+                    direction.getStepX() * 0.5,
+                    direction.getStepY() * 0.5,
+                    direction.getStepZ() * 0.5
+            );
+            Vec3 endInsideTarget = faceCenter.add(
+                    direction.getStepX() * -0.01,
+                    direction.getStepY() * -0.01,
+                    direction.getStepZ() * -0.01
+            );
+            BlockHitResult lineOfSight = world.clip(new ClipContext(
+                    bot.getEyePosition(1.0F),
+                    endInsideTarget,
+                    ClipContext.Block.COLLIDER,
+                    ClipContext.Fluid.NONE,
+                    bot
+            ));
+
+            if (lineOfSight.getType() != HitResult.Type.BLOCK) {
+                continue;
+            }
+
+            BlockPos hitPos = lineOfSight.getBlockPos();
+            if (hitPos.equals(targetBlockPos)) {
+                return null;
+            }
+
+            BlockState hitState = world.getBlockState(hitPos);
+            if (hitState.is(BlockTags.LEAVES) && Math.sqrt(hitPos.distToCenterSqr(bot.position())) <= MAX_MINING_DISTANCE) {
+                return hitPos;
+            }
+        }
+
+        return null;
+    }
+
+    private static void mineObstruction(ServerPlayer bot, BlockPos obstructionPos) {
+        try {
+            BlockState obstructionState = bot.level().getBlockState(obstructionPos);
+            ItemStack bestTool = ToolSelector.selectBestToolForBlock(bot, obstructionState);
+            switchToTool(bot, bestTool);
+            LookController.faceBlock(bot, obstructionPos);
+
+            long deadline = System.currentTimeMillis() + LEAF_CLEAR_TIMEOUT_MS;
+            while (!bot.level().getBlockState(obstructionPos).isAir() && System.currentTimeMillis() < deadline) {
+                bot.swing(bot.getUsedItemHand());
+                bot.gameMode.destroyBlock(obstructionPos);
+                Thread.sleep(100L);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            LOGGER.warn("Failed to clear leaf obstruction {}: {}", obstructionPos, e.getMessage());
+        }
     }
 
     private static boolean canReachVisibleBlock(ServerPlayer bot, BlockPos targetBlockPos) {
@@ -137,4 +221,3 @@ public class MiningTool {
     }
 
 }
-
