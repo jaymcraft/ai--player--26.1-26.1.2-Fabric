@@ -99,6 +99,12 @@ public class FunctionCallerV2 {
 
     private static final Map<String, Object> sharedState = new ConcurrentHashMap<>();  // Updated to Map<String, Object>
 
+    private static volatile Future<?> dragonSpeedrunFuture = null;
+
+    private static volatile long dragonSpeedrunHeartbeatMs = 0L;
+
+    private static final long DRAGON_SPEEDRUN_STALE_MS = TimeUnit.MINUTES.toMillis(2);
+
     private static UUID playerUUID;
 
     private static final Pattern THINK_BLOCK = Pattern.compile("([\\s\\S]*?)", Pattern.DOTALL);
@@ -1419,24 +1425,51 @@ public class FunctionCallerV2 {
                 || (speedrunIntent && dragonTarget);
     }
 
-    private static void startDragonSpeedrunPlan() {
-        if (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active"))) {
+    private static synchronized void startDragonSpeedrunPlan() {
+        if (isDragonSpeedrunActuallyActive()) {
             String alreadyRunning = "I'm already trying to beat the game.";
             getFunctionOutput(alreadyRunning);
             ChatUtils.sendChatMessages(botSource, alreadyRunning);
             return;
         }
 
+        clearDragonSpeedrunState();
         sharedState.put("dragonSpeedrun.active", true);
+        dragonSpeedrunHeartbeatMs = System.currentTimeMillis();
         ChatUtils.sendChatMessages(botSource, "Starting an actual player-like Ender Dragon run. I'll gather, craft, mine, and advance stages without creative shortcuts.");
 
-        executor.submit(() -> {
+        dragonSpeedrunFuture = executor.submit(() -> {
             try {
                 runDragonSpeedrunWorker();
             } finally {
-                sharedState.put("dragonSpeedrun.active", false);
+                clearDragonSpeedrunState();
             }
         });
+    }
+
+    private static boolean isDragonSpeedrunActuallyActive() {
+        if (!Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active"))) {
+            return false;
+        }
+
+        Future<?> worker = dragonSpeedrunFuture;
+        boolean workerRunning = worker != null && !worker.isDone() && !worker.isCancelled();
+        boolean heartbeatFresh = dragonSpeedrunHeartbeatMs > 0
+                && System.currentTimeMillis() - dragonSpeedrunHeartbeatMs < DRAGON_SPEEDRUN_STALE_MS;
+
+        if (workerRunning && heartbeatFresh) {
+            return true;
+        }
+
+        logger.warn("Clearing stale dragon speedrun state. workerRunning={}, heartbeatFresh={}", workerRunning, heartbeatFresh);
+        clearDragonSpeedrunState();
+        return false;
+    }
+
+    private static void clearDragonSpeedrunState() {
+        sharedState.put("dragonSpeedrun.active", false);
+        dragonSpeedrunHeartbeatMs = 0L;
+        dragonSpeedrunFuture = null;
     }
 
     private static void runDragonSpeedrunWorker() {
@@ -1449,6 +1482,7 @@ public class FunctionCallerV2 {
         int actions = 0;
         String lastResult = "Started Ender Dragon speedrun.";
         while (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active")) && actions < 80) {
+            dragonSpeedrunHeartbeatMs = System.currentTimeMillis();
             bot = botSource.getPlayer();
             if (bot == null) {
                 lastResult = "Bot not found.";
@@ -1467,6 +1501,7 @@ public class FunctionCallerV2 {
 
             try {
                 String actionResult = executeDragonSpeedrunStage(bot, stage, inventory);
+                dragonSpeedrunHeartbeatMs = System.currentTimeMillis();
                 lastResult = actionResult;
                 logger.info("Dragon speedrun stage {} result: {}", stage.name(), actionResult);
                 if (actionResult.startsWith("WAIT:")) {
@@ -1523,7 +1558,11 @@ public class FunctionCallerV2 {
             return searchMoveAndMineWood(bot, inventory);
         }
         if (planks < 8 && logs > 0) {
-            return craftItemOnServerThreadSync(bot, "oak_planks", 2);
+            String plankCraftResult = craftAvailablePlanks(bot, inventory, Math.max(1, (8 - planks + 3) / 4));
+            if (plankCraftResult.contains("I don't have the ingredients")) {
+                return searchMoveAndMineWood(bot, inventory);
+            }
+            return plankCraftResult;
         }
         if (sticks < 4) {
             return craftItemOnServerThreadSync(bot, "stick", 1);
@@ -1540,7 +1579,11 @@ public class FunctionCallerV2 {
     private static String executeStoneToolsStage(ServerPlayer bot, Inventory inventory) throws Exception {
         int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
         if (cobble < 11) {
-            return searchMoveAndMineFirst(bot, List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate"), "stone");
+            String searchResult = searchMoveAndMineFirst(bot, List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate"), "stone");
+            if (searchResult.startsWith("WAIT:")) {
+                return mineDownForStone(bot, inventory, 11 - cobble);
+            }
+            return searchResult;
         }
         if (!hasItemByPath(inventory, "stone_pickaxe")) {
             return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
@@ -1552,6 +1595,97 @@ public class FunctionCallerV2 {
             return craftItemOnServerThreadSync(bot, "furnace", 1);
         }
         return "Stone tools complete.";
+    }
+
+    private static String mineDownForStone(ServerPlayer bot, Inventory inventory, int neededCobble) throws Exception {
+        List<String> stoneBlocks = List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate");
+        List<String> cobbleItems = List.of("minecraft:cobblestone", "minecraft:cobbled_deepslate");
+        int beforeCobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
+        int minedStone = 0;
+        String lastMineResult = "No block mined yet.";
+
+        for (int step = 0; step < 18 && minedStone < neededCobble; step++) {
+            BlockPos feet = bot.blockPosition();
+            if (feet.getY() <= bot.level().getMinY() + 2) {
+                break;
+            }
+
+            BlockPos below = feet.below();
+            ServerLevel world = (ServerLevel) bot.level();
+            BlockState belowState = world.getBlockState(below);
+            if (belowState.isAir() || !belowState.getFluidState().isEmpty()) {
+                return "WAIT:I found air or fluid below me, so I stopped digging down for stone.";
+            }
+
+            boolean isStone = isAnyBlockType(world, below, stoneBlocks);
+            lastMineResult = MiningTool.mineBlock(bot, below).get(15, TimeUnit.SECONDS);
+            if (lastMineResult.startsWith("❌") || lastMineResult.startsWith("⚠️")) {
+                return "WAIT:I tried digging down for stone, but couldn't mine the block below me: " + lastMineResult;
+            }
+
+            Thread.sleep(650L);
+            BlockPos loweredFeet = below;
+            Vec3 loweredPosition = new Vec3(loweredFeet.getX() + 0.5, loweredFeet.getY(), loweredFeet.getZ() + 0.5);
+            if (canBotOccupy(bot, loweredPosition, false)) {
+                startPreciseCoordinateMove(loweredFeet.getX(), loweredFeet.getY(), loweredFeet.getZ(), false).get(30, TimeUnit.SECONDS);
+            }
+
+            if (isStone) {
+                minedStone++;
+                collectNearbyDroppedItems(bot, cobbleItems, below, 4.0);
+                Thread.sleep(350L);
+            }
+        }
+
+        collectNearbyDroppedItems(bot, cobbleItems, bot.blockPosition(), 6.0);
+        Thread.sleep(500L);
+        int afterCobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
+        int gainedCobble = Math.max(0, afterCobble - beforeCobble);
+        if (minedStone > 0) {
+            return "Speedrun dug down safely and mined stone. Mined " + minedStone
+                    + " stone blocks, collected +" + gainedCobble + " cobblestone. Last result: " + lastMineResult;
+        }
+
+        return "WAIT:I dug down but didn't reach stone yet.";
+    }
+
+    private static String craftAvailablePlanks(ServerPlayer bot, Inventory inventory, int batches) throws Exception {
+        Optional<String> plankRecipe = findPlankRecipeForInventory(inventory);
+        if (plankRecipe.isEmpty()) {
+            return searchMoveAndMineWood(bot, inventory);
+        }
+
+        String craftResult = craftItemOnServerThreadSync(bot, plankRecipe.get(), batches);
+        if (craftResult.contains("I don't have the ingredients")) {
+            return searchMoveAndMineWood(bot, inventory);
+        }
+        return craftResult;
+    }
+
+    private static Optional<String> findPlankRecipeForInventory(Inventory inventory) {
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            String path = itemId(stack.getItem()).getPath();
+            Optional<String> woodName = woodNameFromLogPath(path);
+            if (woodName.isPresent()) {
+                return Optional.of(woodName.get() + "_planks");
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> woodNameFromLogPath(String path) {
+        String cleaned = path.startsWith("stripped_") ? path.substring("stripped_".length()) : path;
+        for (String suffix : List.of("_log", "_wood", "_stem", "_hyphae")) {
+            if (cleaned.endsWith(suffix)) {
+                return Optional.of(cleaned.substring(0, cleaned.length() - suffix.length()));
+            }
+        }
+        return Optional.empty();
     }
 
     private static String executeResourceSearchStage(ServerPlayer bot, String blockType, String message) throws Exception {
