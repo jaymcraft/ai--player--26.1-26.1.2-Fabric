@@ -5,6 +5,9 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.shasankp000.Commands.modCommandRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -209,6 +212,18 @@ public class PathTracer {
                 return;
             }
 
+            try {
+                if (tryPreciseSegmentFallback(player, completedSegment)) {
+                    LOGGER.info("✅ Reached segment target with precise fallback: {}", completedSegment.end());
+                    retries = 0;
+                    isMoving = false;
+                    startProcessing();
+                    return;
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Precise segment fallback failed for {}", completedSegment, e);
+            }
+
             retries++;
             LOGGER.warn("Segment not reached. Retry {}/{}", retries, MAX_RETRIES);
 
@@ -308,6 +323,67 @@ public class PathTracer {
             return Math.abs(pos1.getX() - pos2.getX()) <= 1 &&
                     Math.abs(pos1.getY() - pos2.getY()) <= 1 &&
                     Math.abs(pos1.getZ() - pos2.getZ()) <= 1;
+        }
+
+        private boolean tryPreciseSegmentFallback(ServerPlayer player, Segment segment) throws Exception {
+            Vec3 start = player.position();
+            Vec3 target = new Vec3(segment.end().getX() + 0.5, segment.end().getY(), segment.end().getZ() + 0.5);
+            if (start.distanceTo(target) > 4.0) {
+                return false;
+            }
+
+            int ticks = Math.max(1, (int) Math.ceil(start.distanceTo(target) * 6.0));
+            for (int tick = 0; tick < ticks; tick++) {
+                double progress = (tick + 1) / (double) ticks;
+                Vec3 next = start.lerp(target, progress);
+                CompletableFuture<Boolean> step = new CompletableFuture<>();
+                server.execute(() -> {
+                    if (!canOccupy(player, next)) {
+                        step.complete(false);
+                        return;
+                    }
+
+                    player.teleportTo(
+                            player.level(),
+                            next.x,
+                            next.y,
+                            next.z,
+                            Set.of(),
+                            player.getYRot(),
+                            player.getXRot(),
+                            false
+                    );
+                    step.complete(true);
+                });
+
+                if (!step.get(1, TimeUnit.SECONDS)) {
+                    return false;
+                }
+                Thread.sleep(50L);
+            }
+
+            return hasReachedTarget(player.blockPosition(), segment.end(), segment);
+        }
+
+        private boolean canOccupy(ServerPlayer player, Vec3 position) {
+            ServerLevel world = (ServerLevel) player.level();
+            BlockPos feet = BlockPos.containing(position.x, position.y, position.z);
+            BlockState below = world.getBlockState(feet.below());
+            BlockState body = world.getBlockState(feet);
+            BlockState head = world.getBlockState(feet.above());
+            AABB hitbox = new AABB(
+                    position.x - 0.3,
+                    position.y,
+                    position.z - 0.3,
+                    position.x + 0.3,
+                    position.y + 1.8,
+                    position.z + 0.3
+            );
+            return !below.isAir()
+                    && below.isRedstoneConductor(world, feet.below())
+                    && (body.isAir() || body.canBeReplaced())
+                    && (head.isAir() || head.canBeReplaced())
+                    && world.noCollision(player, hitbox);
         }
 
         // ✅ Updated to return proper format for parsing

@@ -33,6 +33,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -1519,7 +1520,7 @@ public class FunctionCallerV2 {
         int sticks = countItemByPath(inventory, "stick");
 
         if (logs + planks < 8) {
-            return searchMoveAndMineFirst(bot, List.of("minecraft:oak_log", "minecraft:birch_log", "minecraft:spruce_log", "minecraft:jungle_log", "minecraft:acacia_log", "minecraft:dark_oak_log", "minecraft:mangrove_log", "minecraft:cherry_log"), "wood");
+            return searchMoveAndMineWood(bot, inventory);
         }
         if (planks < 8 && logs > 0) {
             return craftItemOnServerThreadSync(bot, "oak_planks", 2);
@@ -1569,13 +1570,12 @@ public class FunctionCallerV2 {
 
     private static String searchMoveAndMineFirst(ServerPlayer bot, List<String> blockTypes, String label) throws Exception {
         for (String blockType : blockTypes) {
-            BlockPos found = net.shasankp000.Tools.SearchBlocks.searchBlock(bot, blockType, 8, 64, 16);
+            BlockPos found = net.shasankp000.Tools.SearchBlocks.searchBlock(bot, blockType, 8, 96, 16);
             if (found == null) {
                 continue;
             }
 
-            BlockPos standPos = chooseInteractionPosition(bot, found);
-            String moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), true).get(120, TimeUnit.SECONDS);
+            String moveResult = moveToInteractionPosition(bot, found);
             if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
                 continue;
             }
@@ -1584,6 +1584,251 @@ public class FunctionCallerV2 {
             return "Speedrun mined " + label + " at " + found + ": " + mineResult;
         }
         return "WAIT:I couldn't find nearby " + label + " yet.";
+    }
+
+    private static String searchMoveAndMineWood(ServerPlayer bot, Inventory inventory) throws Exception {
+        List<String> logTypes = List.of(
+                "minecraft:oak_log",
+                "minecraft:birch_log",
+                "minecraft:spruce_log",
+                "minecraft:jungle_log",
+                "minecraft:acacia_log",
+                "minecraft:dark_oak_log",
+                "minecraft:mangrove_log",
+                "minecraft:cherry_log"
+        );
+
+        int beforeLogs = countItemsMatching(inventory, item -> {
+            String path = itemId(item).getPath();
+            return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
+        });
+        int beforePlanks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks"));
+        int neededWoodUnits = Math.max(1, 8 - beforeLogs - beforePlanks);
+
+        List<BlockPos> candidates = findNearestBlocks(bot, logTypes, 96, 24, 32);
+        if (candidates.isEmpty()) {
+            return "WAIT:I couldn't find nearby wood yet.";
+        }
+
+        int mined = 0;
+        String lastMineResult = "No wood mined yet.";
+        for (BlockPos logPos : candidates) {
+            if (mined >= neededWoodUnits) {
+                break;
+            }
+
+            String moveResult = moveToInteractionPosition(bot, logPos);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                logger.info("Could not reach wood candidate {} via {}", logPos, moveResult);
+                continue;
+            }
+
+            List<BlockPos> treeLogs = findNearbyTreeLogs(bot, logPos, logTypes);
+            if (treeLogs.isEmpty()) {
+                treeLogs = List.of(logPos);
+            }
+
+            for (BlockPos treeLog : treeLogs) {
+                if (mined >= neededWoodUnits) {
+                    break;
+                }
+                if (!isAnyBlockType((ServerLevel) bot.level(), treeLog, logTypes)) {
+                    continue;
+                }
+
+                if (!isWithinPlacementRange(bot, treeLog)) {
+                    String repositionResult = moveToInteractionPosition(bot, treeLog);
+                    if (repositionResult.startsWith("❌") || repositionResult.startsWith("⚠️")) {
+                        continue;
+                    }
+                }
+
+                lastMineResult = MiningTool.mineBlock(bot, treeLog).get(15, TimeUnit.SECONDS);
+                if (lastMineResult.startsWith("❌") || lastMineResult.startsWith("⚠️")) {
+                    logger.info("Could not mine tree log {} via {}", treeLog, lastMineResult);
+                    continue;
+                }
+                collectNearbyDroppedItems(bot, logTypes, treeLog, 4.0);
+                mined++;
+                Thread.sleep(450L);
+            }
+        }
+
+        collectNearbyDroppedItems(bot, logTypes, bot.blockPosition(), 8.0);
+        Thread.sleep(1000L);
+        int afterLogs = countItemsMatching(inventory, item -> {
+            String path = itemId(item).getPath();
+            return path.endsWith("_log") || path.endsWith("_wood") || path.endsWith("_stem") || path.endsWith("_hyphae");
+        });
+        int gainedLogs = Math.max(0, afterLogs - beforeLogs);
+        if (mined > 0) {
+            return "Speedrun chopped wood like a player. Mined " + mined + " logs, collected +" + gainedLogs + " logs. Last result: " + lastMineResult;
+        }
+
+        return "WAIT:I found trees, but couldn't reach a visible log to mine yet.";
+    }
+
+    private static void collectNearbyDroppedItems(ServerPlayer bot, List<String> itemTypes, BlockPos origin, double radius) throws Exception {
+        ServerLevel world = (ServerLevel) bot.level();
+        AABB searchBox = new AABB(
+                origin.getX() - radius,
+                origin.getY() - 2.0,
+                origin.getZ() - radius,
+                origin.getX() + radius,
+                origin.getY() + 4.0,
+                origin.getZ() + radius
+        );
+        List<ItemEntity> droppedItems = world.getEntitiesOfClass(ItemEntity.class, searchBox, itemEntity -> {
+            Identifier itemId = BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem());
+            for (String itemType : itemTypes) {
+                Identifier expectedId = Identifier.tryParse(itemType.contains(":") ? itemType : "minecraft:" + itemType);
+                if (expectedId != null && expectedId.equals(itemId)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        droppedItems.sort(Comparator.comparingDouble(itemEntity -> itemEntity.distanceToSqr(bot)));
+        int pickups = Math.min(droppedItems.size(), 8);
+        for (int i = 0; i < pickups; i++) {
+            ItemEntity droppedItem = droppedItems.get(i);
+            if (!droppedItem.isAlive()) {
+                continue;
+            }
+
+            BlockPos itemPos = droppedItem.blockPosition();
+            String moveResult = startPreciseCoordinateMove(itemPos.getX(), itemPos.getY(), itemPos.getZ(), false).get(30, TimeUnit.SECONDS);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                BlockPos standPos = findStandablePickupPosition(bot, itemPos);
+                moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), false).get(30, TimeUnit.SECONDS);
+            }
+            logger.info("Collecting dropped speedrun item at {} via {}", itemPos, moveResult);
+            Thread.sleep(300L);
+        }
+    }
+
+    private static BlockPos findStandablePickupPosition(ServerPlayer bot, BlockPos itemPos) {
+        ServerLevel world = (ServerLevel) bot.level();
+        BlockPos currentPos = bot.blockPosition();
+        BlockPos best = currentPos;
+        int bestDistance = Integer.MAX_VALUE;
+        for (int radius = 0; radius <= 2; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                        continue;
+                    }
+                    int x = itemPos.getX() + dx;
+                    int z = itemPos.getZ() + dz;
+                    int y = findStandableBuilderY(world, x, z, itemPos.getY());
+                    BlockPos candidate = new BlockPos(x, y, z);
+                    if (canBotOccupy(bot, new Vec3(x + 0.5, y, z + 0.5), false)) {
+                        int distance = currentPos.distManhattan(candidate);
+                        if (distance < bestDistance) {
+                            best = candidate;
+                            bestDistance = distance;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private static List<BlockPos> findNearestBlocks(ServerPlayer bot, List<String> blockTypes, int horizontalRadius, int verticalDown, int verticalUp) {
+        ServerLevel world = (ServerLevel) bot.level();
+        BlockPos origin = bot.blockPosition();
+        List<BlockPos> matches = new ArrayList<>();
+
+        for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
+            for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
+                if (dx * dx + dz * dz > horizontalRadius * horizontalRadius) {
+                    continue;
+                }
+                for (int dy = -verticalDown; dy <= verticalUp; dy++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    if (isAnyBlockType(world, pos, blockTypes)) {
+                        matches.add(pos);
+                    }
+                }
+            }
+        }
+
+        matches.sort(Comparator.comparingDouble(pos -> pos.distToCenterSqr(bot.position())));
+        return matches;
+    }
+
+    private static List<BlockPos> findNearbyTreeLogs(ServerPlayer bot, BlockPos firstLog, List<String> logTypes) {
+        ServerLevel world = (ServerLevel) bot.level();
+        List<BlockPos> logs = new ArrayList<>();
+        for (int dy = 0; dy <= 6; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    BlockPos pos = firstLog.offset(dx, dy, dz);
+                    if (isAnyBlockType(world, pos, logTypes)) {
+                        logs.add(pos);
+                    }
+                }
+            }
+        }
+        logs.sort(Comparator.comparingDouble(pos -> pos.distToCenterSqr(bot.position())));
+        return uniqueBlockList(logs);
+    }
+
+    private static boolean isAnyBlockType(ServerLevel world, BlockPos pos, List<String> blockTypes) {
+        Identifier currentId = BuiltInRegistries.BLOCK.getKey(world.getBlockState(pos).getBlock());
+        for (String blockType : blockTypes) {
+            Identifier expectedId = Identifier.tryParse(blockType.contains(":") ? blockType : "minecraft:" + blockType);
+            if (expectedId != null && expectedId.equals(currentId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String moveToInteractionPosition(ServerPlayer bot, BlockPos targetPos) throws Exception {
+        List<BlockPos> candidates = findInteractionPositions(bot, targetPos);
+        if (candidates.isEmpty()) {
+            return "❌ No reachable interaction position near " + targetPos;
+        }
+
+        String lastMoveResult = "❌ No interaction move attempted";
+        for (BlockPos candidate : candidates) {
+            lastMoveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true).get(120, TimeUnit.SECONDS);
+            if (!lastMoveResult.startsWith("❌") && !lastMoveResult.startsWith("⚠️")) {
+                return lastMoveResult;
+            }
+
+            String pathResult = GoTo.goTo(botSource, candidate.getX(), candidate.getY(), candidate.getZ(), true);
+            if (!pathResult.startsWith("Failed")
+                    && !pathResult.startsWith("Error")
+                    && bot.blockPosition().distManhattan(candidate) <= 2) {
+                return pathResult;
+            }
+            lastMoveResult = pathResult;
+        }
+        return lastMoveResult;
+    }
+
+    private static List<BlockPos> findInteractionPositions(ServerPlayer bot, BlockPos targetPos) {
+        ServerLevel world = (ServerLevel) bot.level();
+        BlockPos currentPos = bot.blockPosition();
+        List<BlockPos> candidates = new ArrayList<>();
+        for (Direction direction : List.of(Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST)) {
+            for (int radius = 1; radius <= 2; radius++) {
+                int x = targetPos.getX() + direction.getStepX() * radius;
+                int z = targetPos.getZ() + direction.getStepZ() * radius;
+                int y = findStandableBuilderY(world, x, z, targetPos.getY());
+                BlockPos candidate = new BlockPos(x, y, z);
+                Vec3 candidatePosition = new Vec3(x + 0.5, y, z + 0.5);
+                if (canBotOccupy(bot, candidatePosition, false) && Math.sqrt(targetPos.distToCenterSqr(candidatePosition)) <= 4.5) {
+                    candidates.add(candidate);
+                }
+            }
+        }
+        candidates.sort(Comparator.comparingInt(currentPos::distManhattan));
+        return uniqueBlockList(candidates);
     }
 
     private static BlockPos chooseInteractionPosition(ServerPlayer bot, BlockPos targetPos) {
