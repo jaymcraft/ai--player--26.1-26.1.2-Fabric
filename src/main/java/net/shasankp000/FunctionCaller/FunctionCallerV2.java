@@ -103,6 +103,8 @@ public class FunctionCallerV2 {
 
     private static volatile long dragonSpeedrunHeartbeatMs = 0L;
 
+    private static volatile long dragonSpeedrunRunId = 0L;
+
     private static final long DRAGON_SPEEDRUN_STALE_MS = TimeUnit.MINUTES.toMillis(2);
 
     private static UUID playerUUID;
@@ -1410,7 +1412,7 @@ public class FunctionCallerV2 {
             return false;
         }
 
-        startDragonSpeedrunPlan();
+        startDragonSpeedrunPlan(true);
         return true;
     }
 
@@ -1428,23 +1430,39 @@ public class FunctionCallerV2 {
     }
 
     private static synchronized void startDragonSpeedrunPlan() {
+        startDragonSpeedrunPlan(false);
+    }
+
+    private static synchronized void startDragonSpeedrunPlan(boolean restartExisting) {
         if (isDragonSpeedrunActuallyActive()) {
-            String alreadyRunning = "I'm already trying to beat the game.";
-            getFunctionOutput(alreadyRunning);
-            ChatUtils.sendChatMessages(botSource, alreadyRunning);
-            return;
+            if (!restartExisting) {
+                String continuing = "Continuing the Ender Dragon run.";
+                getFunctionOutput(continuing);
+                ChatUtils.sendChatMessages(botSource, continuing);
+                return;
+            }
+
+            logger.info("Restarting active dragon speedrun after explicit player request");
+            Future<?> activeWorker = dragonSpeedrunFuture;
+            if (activeWorker != null && !activeWorker.isDone()) {
+                activeWorker.cancel(true);
+            }
+            clearDragonSpeedrunState();
         }
 
         clearDragonSpeedrunState();
         sharedState.put("dragonSpeedrun.active", true);
         dragonSpeedrunHeartbeatMs = System.currentTimeMillis();
+        long runId = ++dragonSpeedrunRunId;
         ChatUtils.sendChatMessages(botSource, "Starting an actual player-like Ender Dragon run. I'll gather, craft, mine, and advance stages without creative shortcuts.");
 
         dragonSpeedrunFuture = executor.submit(() -> {
             try {
                 runDragonSpeedrunWorker();
             } finally {
-                clearDragonSpeedrunState();
+                if (dragonSpeedrunRunId == runId) {
+                    clearDragonSpeedrunState();
+                }
             }
         });
     }

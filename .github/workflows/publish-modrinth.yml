@@ -1,0 +1,74 @@
+name: Publish to Modrinth
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Modrinth version number, e.g. 0.2.0-alpha+26.1.2'
+        required: true
+        default: '0.2.0-alpha+26.1.2'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Modrinth Version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Read mod properties
+        shell: bash
+        run: |
+          MOD_VERSION="$(grep '^mod_version=' gradle.properties | cut -d= -f2-)"
+          MINECRAFT_VERSION="$(grep '^minecraft_version=' gradle.properties | cut -d= -f2-)"
+          ARCHIVES_BASE_NAME="$(grep '^archives_base_name=' gradle.properties | cut -d= -f2-)"
+          RELEASE_VERSION="${{ github.event.inputs.release_version }}"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [[ -z "${RELEASE_VERSION}" ]]; then
+            RELEASE_VERSION="0.2.0-alpha+${MINECRAFT_VERSION}"
+          fi
+
+          MC_VERSION_FAMILY="$(echo "${MINECRAFT_VERSION}" | cut -d. -f1,2)"
+          RELEASE_NAME="AI-player-Fabric-${MC_VERSION_FAMILY}-${MINECRAFT_VERSION} ${RELEASE_VERSION}"
+
+          {
+            echo "MOD_VERSION=${MOD_VERSION}"
+            echo "MINECRAFT_VERSION=${MINECRAFT_VERSION}"
+            echo "ARCHIVES_BASE_NAME=${ARCHIVES_BASE_NAME}"
+            echo "RELEASE_VERSION=${RELEASE_VERSION}"
+            echo "RELEASE_NAME=${RELEASE_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: ./gradlew build --stacktrace
+
+      - name: Publish to Modrinth
+        uses: cloudnode-pro/modrinth-publish@v2
+        with:
+          token: ${{ secrets.MODRINTH_TOKEN }}
+          project: ${{ secrets.MODRINTH_PROJECT_ID }}
+          name: ${{ env.RELEASE_NAME }}
+          version: ${{ env.RELEASE_VERSION }}
+          loaders: fabric
+          game-versions: ${{ env.MINECRAFT_VERSION }}
+          files: build/libs/${{ env.ARCHIVES_BASE_NAME }}-${{ env.MOD_VERSION }}.jar
