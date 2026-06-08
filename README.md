@@ -26,25 +26,6 @@ This mod also relies on the ollama4j project. https://github.com/amithkoujalgi/o
 
 1.Modrinth https://modrinth.com/mod/ai-player-fabric-26.1-26.1.2
 
----
-
-# Progress: 75.5%
-
----
-# Current stage of the mod
-
-Since the new semester in my college has started this month, I am gonna be under really heavy pressure, since I have to study 11 subjects in total (Machine learning, Linear Algebra, Physics, CyberSecurity, and a lot more lol). Don't worry though I won't stop working on this project, it's just that the updates will be quite slower.
-
-It's understandable if y'all leave by then or give up on this project, so, I won't mind. :))
-
-Thank you all from the core of my heart for the support so far. I never imagined we would come this far.
-
-Latest Update: 21/8/2025 at 04:08 AM IST (Indian Standard Time)
-
-
-Please have patience while waiting for updates. Since I am the only guy working on this project, it does take me time to address all the issues/add in new features.
-
----
 # Changelog v1.0.5.2-release+1.21.1
 
 **Important: Earlier proposed second part features will be added in the next patch and this new update marks the end of support for 1.20.6 and below.**
