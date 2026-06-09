@@ -15,6 +15,7 @@ import net.shasankp000.Commands.configCommand;
 import net.shasankp000.Commands.modCommandRegistry;
 import net.shasankp000.Database.QTable;
 import net.shasankp000.Database.SQLiteDB;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.FilingSystem.ManualConfig;
 import net.shasankp000.GameAI.BotEventHandler;
 
@@ -60,7 +61,7 @@ public class AIPlayer implements ModInitializer {
 			LOGGER.info("Set DJL cache directory to: {}", djlCacheDir);
 		}
 
-		String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
+		String llmProvider = LLMProviderConfig.getConfiguredProvider();
 
 		System.out.println("Using provider: " + llmProvider);
 

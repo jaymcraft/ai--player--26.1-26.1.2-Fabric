@@ -82,13 +82,15 @@ public class GenericOpenAIClient implements LLMClient {
             requestBody.add("messages", messages);
             requestBody.addProperty("max_tokens", MAX_OUTPUT_TOKENS);
 
-            HttpRequest request = HttpRequest.newBuilder()
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "chat/completions"))
-                    .header("Authorization", "Bearer " + apiKey)
                     .header("Content-Type", "application/json")
                     .timeout(REQUEST_TIMEOUT)
-                    .POST(BodyPublishers.ofString(requestBody.toString()))
-                    .build();
+                    .POST(BodyPublishers.ofString(requestBody.toString()));
+            if (apiKey != null && !apiKey.isBlank()) {
+                requestBuilder.header("Authorization", "Bearer " + apiKey);
+            }
+            HttpRequest request = requestBuilder.build();
 
             HttpResponse<String> response = client.send(request, BodyHandlers.ofString());
             LOGGER.info("Custom chat completion response: HTTP {} from {}", response.statusCode(), request.uri());
@@ -122,12 +124,14 @@ public class GenericOpenAIClient implements LLMClient {
     @Override
     public boolean isReachable() {
         try {
-            HttpRequest request = HttpRequest.newBuilder()
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "models"))
-                    .header("Authorization", "Bearer " + apiKey)
                     .timeout(REQUEST_TIMEOUT)
-                    .GET()
-                    .build();
+                    .GET();
+            if (apiKey != null && !apiKey.isBlank()) {
+                requestBuilder.header("Authorization", "Bearer " + apiKey);
+            }
+            HttpRequest request = requestBuilder.build();
             HttpResponse<String> response = client.send(request, BodyHandlers.ofString());
             LOGGER.info("Custom models response: HTTP {} from {}", response.statusCode(), request.uri());
             return response.statusCode() == 200;

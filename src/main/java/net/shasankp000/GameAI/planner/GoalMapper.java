@@ -5,6 +5,7 @@ import io.github.amithkoujalgi.ollama4j.core.models.chat.OllamaChatMessage;
 import io.github.amithkoujalgi.ollama4j.core.models.chat.OllamaChatMessageRole;
 import net.shasankp000.AIPlayer;
 import net.shasankp000.FilingSystem.LLMClientFactory;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.OllamaClient.OllamaAPIHelper;
 import net.shasankp000.OllamaClient.OllamaThinkingResponse;
 import net.shasankp000.ServiceLLMClients.LLMClient;
@@ -105,7 +106,7 @@ public class GoalMapper {
      * Parse goal using LLM with a very focused, fast prompt.
      */
     private static short parseGoalWithLLM(String naturalLanguageGoal) {
-        String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
+        String llmProvider = LLMProviderConfig.getConfiguredProvider();
 
         try {
             // Build goal list for prompt
@@ -185,7 +186,7 @@ public class GoalMapper {
                     return GOAL_UNKNOWN;
 
 
-                case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom":
+                case "openai", "gpt", "gemini", "claude", "grok", "custom":
                     LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
 
                     if (llmClient == null) {
@@ -281,4 +282,3 @@ public class GoalMapper {
         return GOAL_ID_TO_NAME.containsKey(goalId);
     }
 }
-

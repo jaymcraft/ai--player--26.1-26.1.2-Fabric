@@ -7,6 +7,7 @@ import net.minecraft.client.gui.components.toasts.SystemToast;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.shasankp000.AIPlayer;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.Network.configNetworkManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -132,11 +133,11 @@ public class APIKeysScreen extends Screen {
         AIPlayer.CONFIG.save();
 
         // 3. Send a network packet for the currently selected mode only if it's a valid provider.
-        String llmMode = System.getProperty("aiplayer.llmMode", "ollama");
+        String llmMode = LLMProviderConfig.getConfiguredProvider();
 
         switch (llmMode) {
-            case "openai":
-                configNetworkManager.sendSaveAPIPacket(llmMode, this.openAIKeyField.getValue());
+            case "openai", "gpt":
+                configNetworkManager.sendSaveAPIPacket("openai", this.openAIKeyField.getValue());
                 return;
             case "gemini":
                 configNetworkManager.sendSaveAPIPacket(llmMode, this.geminiKeyField.getValue());

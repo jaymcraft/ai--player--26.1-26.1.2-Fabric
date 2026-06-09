@@ -29,6 +29,7 @@ import net.shasankp000.DangerZoneDetector.DangerZoneDetector;
 import net.shasankp000.Database.QTableExporter;
 import net.shasankp000.Entity.*;
 import net.shasankp000.FilingSystem.LLMClientFactory;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.GameAI.BotEventHandler;
 import net.shasankp000.OllamaClient.ollamaClient;
 import net.shasankp000.PathFinding.ChartPathToBlock;
@@ -935,7 +936,7 @@ public class modCommandRegistry {
 
         String llmProvider = getConfiguredLlmProvider();
         switch (llmProvider) {
-            case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom" -> {
+            case "openai", "gpt", "gemini", "claude", "grok", "custom" -> {
                 LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
                 if (llmClient == null) {
                     ChatUtils.sendSystemMessage(playerSource, "Cannot initialize " + llmProvider + ": missing or invalid API configuration.");
@@ -946,8 +947,8 @@ public class modCommandRegistry {
             }
             case "ollama" -> ollamaClient.runFromChat(targetBotName, message, Objects.requireNonNull(playerSource.getPlayer()).getUUID());
             default -> {
-                LOGGER.warn("Unsupported provider {}. Defaulting to Ollama client.", llmProvider);
-                ollamaClient.runFromChat(targetBotName, message, Objects.requireNonNull(playerSource.getPlayer()).getUUID());
+                LOGGER.warn("Unsupported provider {}.", llmProvider);
+                ChatUtils.sendSystemMessage(playerSource, "Unsupported provider " + llmProvider + ". Use aiplayer.llmMode=custom for OpenAI-compatible endpoints.");
             }
         }
     }
@@ -1054,7 +1055,7 @@ public class modCommandRegistry {
                 System.out.println("Using provider: " + llmProvider);
 
                 switch (llmProvider) {
-                    case "openai", "gpt", "google", "gemini", "anthropic", "claude", "xAI", "xai", "grok", "custom":
+                    case "openai", "gpt", "gemini", "claude", "grok", "custom":
                         LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
                         if (llmClient == null) {
                             ChatUtils.sendSystemMessage(serverSource, "Cannot initialize " + llmProvider + ": missing or invalid API configuration.");
@@ -1138,30 +1139,9 @@ public class modCommandRegistry {
                         break;
 
                     default:
-                        LOGGER.warn("Unsupported provider detected. Defaulting to Ollama client");
-                        ChatUtils.sendSystemMessage(serverSource, "Warning! Unsupported provider detected. Defaulting to Ollama client");
-                        ChatUtils.sendSystemMessage(serverSource, "Please wait while " + requestedBotName + " connects to the language model.");
-                        ollamaClient.initializeOllamaClient();
-
-                        new Thread(() -> {
-                            while (!ollamaClient.isInitialized) {
-                                try {
-                                    Thread.sleep(500L); // Check every 500ms
-                                } catch (InterruptedException e) {
-                                    LOGGER.error("Ollama client initialization interrupted.");
-                                    Thread.currentThread().interrupt();
-                                    break;
-                                }
-                            }
-
-                            //initialization succeeded, continue:
-                            ollamaClient.sendInitialResponse(bot.createCommandSourceStack().withSuppressedOutput());
-                            AutoFaceEntity.startAutoFace(bot);
-
-                            Thread.currentThread().interrupt(); // close this thread.
-
-                        }).start();
-
+                        LOGGER.warn("Unsupported provider detected: {}", llmProvider);
+                        ChatUtils.sendSystemMessage(serverSource, "Unsupported provider " + llmProvider + ". Use aiplayer.llmMode=custom for OpenAI-compatible endpoints.");
+                        AutoFaceEntity.startAutoFace(bot);
                         break;
 
                 }
@@ -1209,12 +1189,12 @@ public class modCommandRegistry {
     }
 
     private static String getConfiguredLlmProvider() {
-        String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
-        if (llmProvider == null || llmProvider.isBlank()) {
-            LOGGER.warn("aiplayer.llmMode is empty. Defaulting to ollama.");
-            return "ollama";
+        String llmProvider = LLMProviderConfig.getConfiguredProvider();
+        if (llmProvider.isBlank()) {
+            LOGGER.warn("aiplayer.llmMode is empty. Defaulting to custom OpenAI-compatible provider.");
+            return LLMProviderConfig.DEFAULT_PROVIDER;
         }
-        return llmProvider.trim();
+        return llmProvider;
     }
 
     private static void notImplementedMessage(CommandContext<CommandSourceStack> context) {

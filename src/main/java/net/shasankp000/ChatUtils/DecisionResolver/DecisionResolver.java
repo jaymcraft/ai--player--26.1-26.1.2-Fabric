@@ -9,6 +9,7 @@ import io.github.amithkoujalgi.ollama4j.core.models.chat.OllamaChatRequestModel;
 import io.github.amithkoujalgi.ollama4j.core.models.chat.OllamaChatResult;
 import net.shasankp000.AIPlayer;
 import net.shasankp000.FilingSystem.LLMClientFactory;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.ServiceLLMClients.LLMClient;
 import net.shasankp000.ServiceLLMClients.LLMServiceHandler;
 import org.slf4j.Logger;
@@ -71,12 +72,12 @@ public class DecisionResolver {
 
         String selectedLM = AIPlayer.CONFIG.getSelectedLanguageModel();
 
-        String llmProvider = System.getProperty("aiplayer.llmMode", "ollama");
+        String llmProvider = LLMProviderConfig.getConfiguredProvider();
 
         String answer = "";
 
         switch (llmProvider) {
-            case "openai", "gpt", "claude", "anthropic", "grok", "xAI", "xai", "gemini", "google", "custom":
+            case "openai", "gpt", "claude", "grok", "gemini", "custom":
                 LLMClient llmClient = LLMClientFactory.createClient(llmProvider);
                 if (llmClient!=null) {
                     if (llmClient.isReachable()) {

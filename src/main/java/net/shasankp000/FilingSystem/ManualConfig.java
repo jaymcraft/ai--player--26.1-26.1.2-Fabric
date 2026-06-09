@@ -33,7 +33,7 @@ public class ManualConfig {
     // --- Configuration fields (same as before) ---
     private List<String> modelList = new ArrayList<>();
     private String selectedLanguageModel;
-    private String llmMode = System.getProperty("aiplayer.llmMode", "ollama");
+    private String llmMode = LLMProviderConfig.getConfiguredProvider();
     private String openAIKey = "";
     private String claudeKey = "";
     private String geminiKey = "";
@@ -75,7 +75,7 @@ public class ManualConfig {
                 ModelFetcher modelFetcher = null;
                 String apiKey = "";
 
-                switch (llmMode) {
+                switch (LLMProviderConfig.normalizeProvider(llmMode)) {
                     case "ollama":
                         LOGGER.info("Using ollama");
                         fetchedModels = getLanguageModels.get();
@@ -90,7 +90,7 @@ public class ManualConfig {
                         this.modelList = fetchedModels;
                         this.save();
                         return;
-                    case "openai":
+                    case "openai", "gpt":
                         modelFetcher = new OpenAIModelFetcher();
                         apiKey = this.openAIKey;
                         break;
@@ -120,7 +120,7 @@ public class ManualConfig {
                         return;
                 }
 
-                if (llmMode.equals("ollama")) {
+                if (LLMProviderConfig.isOllama(llmMode)) {
                     // ollama is handled above, so we just skip API key check.
                     LOGGER.info("Skipping API key check for ollama");
                     this.modelList = fetchedModels;
@@ -129,7 +129,7 @@ public class ManualConfig {
                 }
                 else {
                     if (modelFetcher != null) {
-                        if(apiKey.isEmpty()) {
+                        if(apiKey.isEmpty() && !LLMProviderConfig.normalizeProvider(llmMode).equals("custom")) {
                             // in the event that a user removes their api key but still have a service based provider set.
                             fetchedModels = new ArrayList<>();
                             selectedLanguageModel="No models available. Please enter an API key";
@@ -198,7 +198,7 @@ public class ManualConfig {
             Type type = new TypeToken<ManualConfig>(){}.getType();
             ManualConfig loadedConfig = gson.fromJson(reader, type);
             // After loading, ensure the model list is updated.
-            String currentProvider = System.getProperty("aiplayer.llmMode", "ollama");
+            String currentProvider = LLMProviderConfig.getConfiguredProvider();
             loadedConfig.checkAndUpdateProvider(currentProvider);
             return loadedConfig;
         } catch (IOException e) {

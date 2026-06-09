@@ -8,6 +8,7 @@ import io.github.amithkoujalgi.ollama4j.core.exceptions.OllamaBaseException;
 import io.github.amithkoujalgi.ollama4j.core.models.chat.*;
 import net.shasankp000.AIPlayer;
 import net.shasankp000.FilingSystem.LLMClientFactory;
+import net.shasankp000.FilingSystem.LLMProviderConfig;
 import net.shasankp000.ServiceLLMClients.LLMClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,7 +33,7 @@ public class WebSearchTool {
             .build();
     private static final OllamaAPI ollamaAPI = new OllamaAPI("http://localhost:11434/");
     private static String selectedLM = AIPlayer.CONFIG.getSelectedLanguageModel();
-    private static String llmMode = System.getProperty("aiplayer.llmMode", "ollama");
+    private static String llmMode = LLMProviderConfig.getConfiguredProvider();
     private static final Path CACHE_DIR = Paths.get("web_cache");
 
     static {
@@ -177,8 +178,9 @@ public class WebSearchTool {
 
         String response = "";
 
+        llmMode = LLMProviderConfig.getConfiguredProvider();
         switch (llmMode) {
-            case "openai", "gemini", "claude", "grok":
+            case "openai", "gpt", "gemini", "claude", "grok", "custom":
                 LLMClient client = LLMClientFactory.createClient(llmMode);
 
                 if (client != null)  {
@@ -264,29 +266,7 @@ public class WebSearchTool {
             response = client.sendPrompt(queryConvo.toString(), prompt);
         }
         else {
-            logger.warn("{} is not reachable at the moment, falling back to ollama client.", client.getProvider());
-
-            try {
-                List<OllamaChatMessage> messages = new java.util.ArrayList<>();
-                messages.add(new OllamaChatMessage(OllamaChatMessageRole.SYSTEM, queryConvo.toString()));
-                messages.add(new OllamaChatMessage(OllamaChatMessageRole.USER, prompt));
-
-                net.shasankp000.OllamaClient.OllamaThinkingResponse thinkingResponse =
-                        net.shasankp000.OllamaClient.OllamaAPIHelper.smartChat(
-                                ollamaAPI,
-                                "http://localhost:11434",
-                                selectedLM,
-                                messages
-                        );
-
-                response = thinkingResponse.getContent();
-                logger.info("Generated query: {}", response);
-
-            } catch (IOException | InterruptedException e) {
-                logger.error("Caught exception while creating queries: {} ", (Object) e.getStackTrace());
-                logger.debug("Response before exception: {}", response);
-                throw new RuntimeException(e);
-            }
+            throw new IllegalStateException(client.getProvider() + " is not reachable at the moment.");
         }
 
 
