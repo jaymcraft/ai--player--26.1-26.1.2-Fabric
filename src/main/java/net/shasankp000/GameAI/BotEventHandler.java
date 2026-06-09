@@ -1090,7 +1090,11 @@ public class BotEventHandler {
 
         if (!weaponReady) {
             LOGGER.warn("⚠ Could not equip {} - falling back to melee", weaponType);
-            server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack");
+            if (distance <= HostileMobAttackTool.MELEE_ATTACK_REACH) {
+                server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack");
+            } else {
+                executeMeleeRush(bot, hostiles, strategy, server, botSource, botName);
+            }
             return;
         }
 
@@ -1140,8 +1144,9 @@ public class BotEventHandler {
             AutoFaceEntity.startPersistentBlocking(bot, (net.minecraft.world.entity.LivingEntity) target, server);
         }
 
-        // Move forward while blocking (for 2-3 seconds or until in melee range)
-        int advanceDuration = (int) Math.min(3000, distance * 200); // ~200ms per block
+        // Move forward while blocking until close enough for a 3 block melee attack.
+        int advanceDuration = (int) Math.min(3000,
+                Math.max(0.0, distance - HostileMobAttackTool.MELEE_ATTACK_REACH) * 200); // ~200ms per block
         LOGGER.info("🛡 Advancing for {}ms", advanceDuration);
 
         server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " sprint");
@@ -1152,7 +1157,16 @@ public class BotEventHandler {
             server.execute(() -> {
                 // Stop blocking and attack
                 AutoFaceEntity.stopPersistentBlocking(bot, server);
-                server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stopMoving");
+                server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stop");
+
+                double currentDistance = Math.sqrt(target.distanceToSqr(bot));
+                if (currentDistance > HostileMobAttackTool.MELEE_ATTACK_REACH) {
+                    LOGGER.info("🛡 Shield advance stopped at {}m, outside {} block attack reach",
+                            String.format("%.1f", currentDistance),
+                            String.format("%.1f", HostileMobAttackTool.MELEE_ATTACK_REACH));
+                    return;
+                }
+
                 server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack continuous");
 
                 LOGGER.info("⚔ Reached melee range - attacking!");
@@ -1185,11 +1199,37 @@ public class BotEventHandler {
         // Equip melee weapon
         equipWeapon(bot, strategy.primaryWeapon, server, botSource, botName);
 
-        // Sprint and attack
+        // Sprint toward the target and only swing once the target is within 3 blocks.
         server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " sprint");
-        server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack continuous");
 
-        LOGGER.info("✓ Melee rush initiated");
+        if (distance <= HostileMobAttackTool.MELEE_ATTACK_REACH) {
+            server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack continuous");
+            LOGGER.info("✓ Melee rush attacking within {} block reach",
+                    String.format("%.1f", HostileMobAttackTool.MELEE_ATTACK_REACH));
+            return;
+        }
+
+        server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " move forward");
+        int approachDuration = (int) Math.min(3000,
+                Math.max(0.0, distance - HostileMobAttackTool.MELEE_ATTACK_REACH) * 200);
+
+        executor.schedule(() -> {
+            server.execute(() -> {
+                server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stop");
+
+                double currentDistance = Math.sqrt(target.distanceToSqr(bot));
+                if (currentDistance <= HostileMobAttackTool.MELEE_ATTACK_REACH) {
+                    server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack continuous");
+                    LOGGER.info("✓ Melee rush reached {}m and started attacking", String.format("%.1f", currentDistance));
+                } else {
+                    LOGGER.info("Melee rush stopped at {}m, outside {} block attack reach",
+                            String.format("%.1f", currentDistance),
+                            String.format("%.1f", HostileMobAttackTool.MELEE_ATTACK_REACH));
+                }
+            });
+        }, approachDuration, TimeUnit.MILLISECONDS);
+
+        LOGGER.info("✓ Melee rush approach initiated");
     }
 
     /**
@@ -1236,14 +1276,24 @@ public class BotEventHandler {
 
             LOGGER.info("🏃 Zigzag approach started");
 
-            // Schedule attack when close (estimated time based on distance)
-            int approachTime = (int) Math.min(3000, distance * 150);
+            // Schedule attack when close enough for a 3 block melee attack.
+            int approachTime = (int) Math.min(3000,
+                    Math.max(0.0, distance - HostileMobAttackTool.MELEE_ATTACK_REACH) * 150);
             executor.schedule(() -> {
                 server.execute(() -> {
-                    server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stopMoving");
+                    server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " stop");
                     server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " jump");
+
+                    double currentDistance = Math.sqrt(target.distanceToSqr(bot));
+                    if (currentDistance > HostileMobAttackTool.MELEE_ATTACK_REACH) {
+                        LOGGER.info("Evasive melee stopped at {}m, outside {} block attack reach",
+                                String.format("%.1f", currentDistance),
+                                String.format("%.1f", HostileMobAttackTool.MELEE_ATTACK_REACH));
+                        return;
+                    }
+
                     server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " attack continuous");
-                    LOGGER.info("⚔ Evasive melee attack commenced");
+                    LOGGER.info("⚔ Evasive melee attack commenced within {}m", String.format("%.1f", currentDistance));
                 });
             }, approachTime, TimeUnit.MILLISECONDS);
         }

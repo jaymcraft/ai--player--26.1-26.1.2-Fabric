@@ -1004,6 +1004,7 @@ public class modCommandRegistry {
                 LOGGER.info("Spawned new bot {}!", requestedBotName);
 
                 setBotKnockbackResistance(bot);
+                setBotAttackReach(bot);
 
                 RespawnHandler.registerRespawnListener(bot);
 
@@ -1038,6 +1039,7 @@ public class modCommandRegistry {
                 System.out.println("Preparing for connection to language model....");
 
                 setBotKnockbackResistance(bot);
+                setBotAttackReach(bot);
 
                 System.out.println("Registering respawn listener....");
 
@@ -1186,6 +1188,16 @@ public class modCommandRegistry {
         }
 
         knockbackResistance.setBaseValue(0.0);
+    }
+
+    private static void setBotAttackReach(ServerPlayer bot) {
+        var attackReach = bot.getAttribute(Attributes.ENTITY_INTERACTION_RANGE);
+        if (attackReach == null) {
+            LOGGER.warn("Bot {} does not have an entity interaction range attribute", bot.getName().getString());
+            return;
+        }
+
+        attackReach.setBaseValue(HostileMobAttackTool.MELEE_ATTACK_REACH);
     }
 
     private static String getExceptionSummary(Exception e) {

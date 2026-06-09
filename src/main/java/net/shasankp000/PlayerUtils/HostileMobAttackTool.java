@@ -21,8 +21,8 @@ import org.slf4j.LoggerFactory;
 
 public class HostileMobAttackTool {
     private static final Logger LOGGER = LoggerFactory.getLogger("hostile-mob-attack");
+    public static final double MELEE_ATTACK_REACH = 3.0;
     private static final double MAX_VISIBLE_TARGET_RANGE = 16.0;
-    private static final double RANGED_MIN_DISTANCE = 4.0;
 
     public static String attackHostileMobIfSeeable(ServerPlayer bot, MinecraftServer server, CommandSourceStack botSource) {
         if (bot == null || server == null || botSource == null) {
@@ -40,11 +40,17 @@ public class HostileMobAttackTool {
         String targetName = target.getName().getString();
         double distance = bot.position().distanceTo(target.position());
 
-        if (distance > RANGED_MIN_DISTANCE && RangedWeaponUtils.hasBowOrCrossbow(bot) && RangedWeaponUtils.getAmmoType(bot) != null) {
+        if (distance > MELEE_ATTACK_REACH && RangedWeaponUtils.hasBowOrCrossbow(bot) && RangedWeaponUtils.getAmmoType(bot) != null) {
             AutoFaceEntity.setShootingTarget(target);
             server.getCommands().performPrefixedCommand(botSource, "/bot shoot_arrow " + botName + " false");
             return "Attacking seeable hostile mob " + targetName + " at "
                     + String.format("%.1f", distance) + " blocks with a ranged weapon.";
+        }
+
+        if (distance > MELEE_ATTACK_REACH) {
+            return "Target " + targetName + " is "
+                    + String.format("%.1f", distance) + " blocks away, outside the "
+                    + String.format("%.1f", MELEE_ATTACK_REACH) + " block melee attack reach.";
         }
 
         String heldWeapon = equipSwordOrEmptyHand(bot);
