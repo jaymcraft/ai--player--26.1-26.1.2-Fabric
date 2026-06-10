@@ -88,6 +88,8 @@ public class FunctionCallerV2 {
     private static CommandSourceStack botSource = null;
 
     private static final String DB_URL = "jdbc:sqlite:" + "./sqlite_databases/" + "memory_agent.db";
+    private static final int DRAGON_SPEEDRUN_REQUIRED_IRON = 7;
+    private static final int DRAGON_SPEEDRUN_REQUIRED_COAL = 2;
 
     private static final String host = "http://localhost:11434/";
 
@@ -1600,6 +1602,10 @@ public class FunctionCallerV2 {
     private static String executeStoneToolsStage(ServerPlayer bot, Inventory inventory) throws Exception {
         int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
         if (cobble < 11) {
+            String pickaxeResult = ensureUsablePickaxeForStone(bot, inventory);
+            if (!pickaxeResult.equals("OK")) {
+                return pickaxeResult;
+            }
             String searchResult = searchMoveAndMineFirst(bot, List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate"), "stone");
             if (searchResult.startsWith("WAIT:")) {
                 return mineDownForStone(bot, inventory, 11 - cobble);
@@ -1621,10 +1627,40 @@ public class FunctionCallerV2 {
     private static String executeIronRouteStage(ServerPlayer bot, Inventory inventory) throws Exception {
         int rawIron = countItemByPath(inventory, "raw_iron");
         int ironIngots = countItemByPath(inventory, "iron_ingot");
+        int coal = countItemByPath(inventory, "coal");
+        int ironProgress = countDragonSpeedrunIronProgress(inventory);
         boolean hasBucket = hasItemByPath(inventory, "bucket")
                 || hasItemByPath(inventory, "water_bucket")
                 || hasItemByPath(inventory, "lava_bucket");
         boolean hasIronPickaxe = hasItemByPath(inventory, "iron_pickaxe");
+        List<String> ironOreTypes = List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore");
+        List<String> coalOreTypes = List.of("minecraft:coal_ore", "minecraft:deepslate_coal_ore");
+
+        if (ironProgress < DRAGON_SPEEDRUN_REQUIRED_IRON) {
+            String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
+            if (!pickaxeResult.equals("OK")) {
+                return pickaxeResult;
+            }
+            ChatUtils.sendChatMessages(botSource, "I need " + DRAGON_SPEEDRUN_REQUIRED_IRON + " raw iron before portal prep. Current iron progress: " + ironProgress + ".");
+            String exposedResult = searchMoveAndMineFirst(bot, ironOreTypes, "iron ore");
+            if (!exposedResult.startsWith("WAIT:")) {
+                return exposedResult;
+            }
+            return tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
+        }
+
+        if (coal < DRAGON_SPEEDRUN_REQUIRED_COAL) {
+            String pickaxeResult = ensureUsablePickaxeForCoalOre(bot, inventory);
+            if (!pickaxeResult.equals("OK")) {
+                return pickaxeResult;
+            }
+            ChatUtils.sendChatMessages(botSource, "I have enough raw iron. Mining coal until I have " + DRAGON_SPEEDRUN_REQUIRED_COAL + " before portal prep.");
+            String exposedCoalResult = searchMoveAndMineFirst(bot, coalOreTypes, "coal");
+            if (!exposedCoalResult.startsWith("WAIT:")) {
+                return exposedCoalResult;
+            }
+            return tunnelToAndMineCoal(bot, coalOreTypes);
+        }
 
         if (rawIron > 0) {
             if (!hasItemByPath(inventory, "crafting_table")) {
@@ -1634,8 +1670,11 @@ public class FunctionCallerV2 {
                 return craftItemOnServerThreadSync(bot, "furnace", 1);
             }
             if (!hasSmeltingFuel(inventory)) {
+                String pickaxeResult = ensureUsablePickaxeForCoalOre(bot, inventory);
+                if (!pickaxeResult.equals("OK")) {
+                    return pickaxeResult;
+                }
                 ChatUtils.sendChatMessages(botSource, "I have raw iron, but I need coal or charcoal to smelt it.");
-                List<String> coalOreTypes = List.of("minecraft:coal_ore", "minecraft:deepslate_coal_ore");
                 String exposedCoalResult = searchMoveAndMineFirst(bot, coalOreTypes, "coal");
                 if (!exposedCoalResult.startsWith("WAIT:")) {
                     return exposedCoalResult;
@@ -1653,13 +1692,17 @@ public class FunctionCallerV2 {
             return craftItemOnServerThreadSync(bot, "iron_pickaxe", 1);
         }
 
+        String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
+        if (!pickaxeResult.equals("OK")) {
+            return pickaxeResult;
+        }
         ChatUtils.sendChatMessages(botSource, "Searching for iron ore and mining a tunnel toward it if needed.");
-        String exposedResult = searchMoveAndMineFirst(bot, List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore"), "iron ore");
+        String exposedResult = searchMoveAndMineFirst(bot, ironOreTypes, "iron ore");
         if (!exposedResult.startsWith("WAIT:")) {
             return exposedResult;
         }
 
-        return tunnelToAndMineOre(bot, inventory, List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore"), "iron ore");
+        return tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
     }
 
     private static String tunnelToAndMineOre(ServerPlayer bot, Inventory inventory, List<String> oreTypes, String label) throws Exception {
@@ -1690,13 +1733,21 @@ public class FunctionCallerV2 {
                 String path = itemId(item).getPath();
                 return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
             });
+            BlockState minedOreState = bot.level().getBlockState(orePos);
             String mineResult = MiningTool.mineBlock(bot, orePos).get(20, TimeUnit.SECONDS);
-            collectNearbyDroppedItems(bot, List.of("minecraft:raw_iron", "minecraft:iron_ore", "minecraft:deepslate_iron_ore"), orePos, 5.0);
+            collectNearbyDroppedItems(bot, ironDropItemTypes(), orePos, 6.0);
             Thread.sleep(500L);
             int afterOre = countItemsMatching(inventory, item -> {
                 String path = itemId(item).getPath();
                 return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
             });
+            if (afterOre <= beforeOre && bot.level().getBlockState(orePos).isAir() && addRecoveredOreDropDirectly(bot, minedOreState)) {
+                afterOre = countItemsMatching(inventory, item -> {
+                    String path = itemId(item).getPath();
+                    return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
+                });
+                logger.info("Recovered mined iron ore drop directly into inventory after pickup missed it at {}", orePos);
+            }
             return "Speedrun tunneled to " + label + " at " + orePos + " and mined it. Collected +"
                     + Math.max(0, afterOre - beforeOre) + " iron drops. Last result: " + mineResult;
         }
@@ -1729,10 +1780,15 @@ public class FunctionCallerV2 {
             }
 
             int beforeCoal = countItemByPath(bot.getInventory(), "coal");
+            BlockState minedCoalState = bot.level().getBlockState(coalPos);
             String mineResult = MiningTool.mineBlock(bot, coalPos).get(20, TimeUnit.SECONDS);
-            collectNearbyDroppedItems(bot, List.of("minecraft:coal"), coalPos, 5.0);
+            collectNearbyDroppedItems(bot, coalDropItemTypes(), coalPos, 6.0);
             Thread.sleep(350L);
             int afterCoal = countItemByPath(bot.getInventory(), "coal");
+            if (afterCoal <= beforeCoal && bot.level().getBlockState(coalPos).isAir() && addRecoveredOreDropDirectly(bot, minedCoalState)) {
+                afterCoal = countItemByPath(bot.getInventory(), "coal");
+                logger.info("Recovered mined coal drop directly into inventory after pickup missed it at {}", coalPos);
+            }
 
             return "Speedrun tunneled to coal at " + coalPos + " and mined it. Collected +"
                     + Math.max(0, afterCoal - beforeCoal) + " coal. Last result: " + mineResult;
@@ -1937,9 +1993,18 @@ public class FunctionCallerV2 {
                 continue;
             }
 
+            BlockState minedBlockState = bot.level().getBlockState(found);
+            int beforeDrops = countKnownOreDropsForLabel(bot.getInventory(), label);
             String mineResult = MiningTool.mineBlock(bot, found).get(15, TimeUnit.SECONDS);
             if (label.toLowerCase(Locale.ROOT).contains("coal")) {
-                collectNearbyDroppedItems(bot, List.of("minecraft:coal"), found, 5.0);
+                collectNearbyDroppedItems(bot, coalDropItemTypes(), found, 6.0);
+            } else if (label.toLowerCase(Locale.ROOT).contains("iron")) {
+                collectNearbyDroppedItems(bot, ironDropItemTypes(), found, 6.0);
+            }
+            Thread.sleep(250L);
+            int afterDrops = countKnownOreDropsForLabel(bot.getInventory(), label);
+            if (afterDrops <= beforeDrops && bot.level().getBlockState(found).isAir() && addRecoveredOreDropDirectly(bot, minedBlockState)) {
+                logger.info("Recovered mined {} drop directly into inventory after pickup missed it at {}", label, found);
             }
             return "Speedrun mined " + label + " at " + found + ": " + mineResult;
         }
@@ -2060,16 +2125,15 @@ public class FunctionCallerV2 {
         });
 
         droppedItems.sort(Comparator.comparingDouble(itemEntity -> itemEntity.distanceToSqr(bot)));
-        int pickups = Math.min(droppedItems.size(), 4);
-        for (int i = 0; i < pickups; i++) {
-            ItemEntity droppedItem = droppedItems.get(i);
+        for (ItemEntity droppedItem : droppedItems) {
             if (!droppedItem.isAlive()) {
                 continue;
             }
 
             BlockPos itemPos = droppedItem.blockPosition();
             if (droppedItem.distanceToSqr(bot) <= 2.25) {
-                Thread.sleep(100L);
+                triggerNearbyItemPickupSync(bot, itemTypes, itemPos, 2.0);
+                Thread.sleep(200L);
                 continue;
             }
 
@@ -2092,8 +2156,76 @@ public class FunctionCallerV2 {
                 continue;
             }
             logger.info("Collecting dropped speedrun item at {} via {}", itemPos, moveResult);
-            Thread.sleep(100L);
+            triggerNearbyItemPickupSync(bot, itemTypes, itemPos, 2.0);
+            Thread.sleep(250L);
         }
+    }
+
+    private static List<String> ironDropItemTypes() {
+        return List.of("minecraft:raw_iron", "minecraft:iron_ore", "minecraft:deepslate_iron_ore");
+    }
+
+    private static List<String> coalDropItemTypes() {
+        return List.of("minecraft:coal");
+    }
+
+    private static int countKnownOreDropsForLabel(Inventory inventory, String label) {
+        String normalized = label.toLowerCase(Locale.ROOT);
+        if (normalized.contains("coal")) {
+            return countItemByPath(inventory, "coal");
+        }
+        if (normalized.contains("iron")) {
+            return countItemsMatching(inventory, item -> {
+                String path = itemId(item).getPath();
+                return path.equals("raw_iron") || path.equals("iron_ore") || path.equals("deepslate_iron_ore");
+            });
+        }
+        return 0;
+    }
+
+    private static void triggerNearbyItemPickupSync(ServerPlayer bot, List<String> itemTypes, BlockPos origin, double radius) throws Exception {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        botSource.getServer().execute(() -> {
+            try {
+                triggerNearbyItemPickupOnServerThread(bot, itemTypes, origin, radius);
+                future.complete(null);
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+        });
+        future.get(5, TimeUnit.SECONDS);
+    }
+
+    private static void triggerNearbyItemPickupOnServerThread(ServerPlayer bot, List<String> itemTypes, BlockPos origin, double radius) {
+        ServerLevel world = (ServerLevel) bot.level();
+        AABB pickupBox = new AABB(
+                origin.getX() - radius,
+                origin.getY() - radius,
+                origin.getZ() - radius,
+                origin.getX() + radius,
+                origin.getY() + radius,
+                origin.getZ() + radius
+        );
+        List<ItemEntity> pickupItems = world.getEntitiesOfClass(ItemEntity.class, pickupBox, itemEntity ->
+                itemEntity.isAlive()
+                        && itemEntity.distanceToSqr(bot) <= radius * radius
+                        && matchesItemType(itemEntity, itemTypes)
+        );
+
+        for (ItemEntity itemEntity : pickupItems) {
+            itemEntity.playerTouch(bot);
+        }
+    }
+
+    private static boolean matchesItemType(ItemEntity itemEntity, List<String> itemTypes) {
+        Identifier itemId = BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem());
+        for (String itemType : itemTypes) {
+            Identifier expectedId = Identifier.tryParse(itemType.contains(":") ? itemType : "minecraft:" + itemType);
+            if (expectedId != null && expectedId.equals(itemId)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static BlockPos findStandablePickupPosition(ServerPlayer bot, BlockPos itemPos) {
@@ -2312,6 +2444,8 @@ public class FunctionCallerV2 {
         int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
         int iron = countItemByPath(inventory, "iron_ingot");
         int rawIron = countItemByPath(inventory, "raw_iron");
+        int coal = countItemByPath(inventory, "coal");
+        int ironProgress = countDragonSpeedrunIronProgress(inventory);
         int blazeRods = countItemByPath(inventory, "blaze_rod");
         int enderPearls = countItemByPath(inventory, "ender_pearl");
         int eyes = countItemByPath(inventory, "ender_eye");
@@ -2323,9 +2457,9 @@ public class FunctionCallerV2 {
                 || item == Items.DIRT);
 
         boolean hasCraftingTable = hasItemByPath(inventory, "crafting_table");
-        boolean hasWoodPickaxe = hasItemByPath(inventory, "wooden_pickaxe");
-        boolean hasStonePickaxe = hasItemByPath(inventory, "stone_pickaxe");
-        boolean hasIronPickaxe = hasItemByPath(inventory, "iron_pickaxe");
+        boolean hasWoodPickaxe = hasUsableItemByPath(inventory, "wooden_pickaxe");
+        boolean hasStonePickaxe = hasUsableItemByPath(inventory, "stone_pickaxe");
+        boolean hasIronPickaxe = hasUsableItemByPath(inventory, "iron_pickaxe");
         boolean hasWeapon = hasItemByPath(inventory, "stone_sword")
                 || hasItemByPath(inventory, "iron_sword")
                 || hasItemByPath(inventory, "diamond_sword")
@@ -2352,11 +2486,16 @@ public class FunctionCallerV2 {
                     "Mine cobblestone and craft a stone pickaxe, stone axe or sword, and furnace if needed.",
                     "Need stone pickaxe and extra cobblestone."
             );
-        } else if (rawIron > 0 || !hasIronPickaxe || !hasBucket) {
+        } else if (rawIron > 0
+                || ironProgress < DRAGON_SPEEDRUN_REQUIRED_IRON
+                || coal < DRAGON_SPEEDRUN_REQUIRED_COAL
+                || !hasIronPickaxe
+                || !hasBucket) {
             stage = new DragonSpeedrunStage(
                     "Iron route",
-                    "Find iron, mine it with the stone pickaxe, smelt it, then craft bucket and iron pickaxe when possible.",
-                    "Need at least 3 iron ingots for a pickaxe, plus a bucket for portal routing."
+                    "Mine 7 raw iron and 2 coal, then smelt and craft bucket plus iron pickaxe before portal prep.",
+                    "Need " + DRAGON_SPEEDRUN_REQUIRED_IRON + " iron progress and " + DRAGON_SPEEDRUN_REQUIRED_COAL
+                            + " coal. Current: " + ironProgress + " iron progress, " + coal + " coal."
             );
         } else if (!hasBucket || (!hasWater && !hasLava)) {
             stage = new DragonSpeedrunStage(
@@ -2421,6 +2560,71 @@ public class FunctionCallerV2 {
         return countItemsMatching(inventory, item -> itemId(item).getPath().equals(path));
     }
 
+    private static String ensureUsablePickaxeForStone(ServerPlayer bot, Inventory inventory) throws Exception {
+        if (hasUsableItemByPath(inventory, "wooden_pickaxe")
+                || hasUsableItemByPath(inventory, "stone_pickaxe")
+                || hasUsableItemByPath(inventory, "iron_pickaxe")) {
+            return "OK";
+        }
+        return craftItemOnServerThreadSync(bot, "wooden_pickaxe", 1);
+    }
+
+    private static String ensureUsablePickaxeForCoalOre(ServerPlayer bot, Inventory inventory) throws Exception {
+        if (hasUsableItemByPath(inventory, "wooden_pickaxe")
+                || hasUsableItemByPath(inventory, "stone_pickaxe")
+                || hasUsableItemByPath(inventory, "iron_pickaxe")) {
+            return "OK";
+        }
+        if (countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate") >= 3
+                && countItemByPath(inventory, "stick") >= 2) {
+            return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
+        }
+        return craftItemOnServerThreadSync(bot, "wooden_pickaxe", 1);
+    }
+
+    private static String ensureUsablePickaxeForIronOre(ServerPlayer bot, Inventory inventory) throws Exception {
+        if (hasUsableItemByPath(inventory, "iron_pickaxe") || hasUsableItemByPath(inventory, "stone_pickaxe")) {
+            return "OK";
+        }
+        if (countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate") >= 3
+                && countItemByPath(inventory, "stick") >= 2) {
+            return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
+        }
+        if (countItemByPath(inventory, "iron_ingot") >= 3 && countItemByPath(inventory, "stick") >= 2) {
+            return craftItemOnServerThreadSync(bot, "iron_pickaxe", 1);
+        }
+        return "WAIT:I need a replacement stone or iron pickaxe before mining iron, otherwise the ore will not drop.";
+    }
+
+    private static boolean hasUsableItemByPath(Inventory inventory, String path) {
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && itemId(stack.getItem()).getPath().equals(path) && hasEnoughDurabilityForMining(stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasEnoughDurabilityForMining(ItemStack stack) {
+        return !stack.isDamageableItem() || stack.getMaxDamage() - stack.getDamageValue() > 1;
+    }
+
+    private static int countDragonSpeedrunIronProgress(Inventory inventory) {
+        int progress = countItemByPath(inventory, "raw_iron")
+                + countItemByPath(inventory, "iron_ingot");
+        if (hasItemByPath(inventory, "bucket") || hasItemByPath(inventory, "water_bucket") || hasItemByPath(inventory, "lava_bucket")) {
+            progress += 3;
+        }
+        if (hasItemByPath(inventory, "iron_pickaxe")) {
+            progress += 3;
+        }
+        if (hasItemByPath(inventory, "flint_and_steel")) {
+            progress += 1;
+        }
+        return progress;
+    }
+
     private static int countWoodItems(Inventory inventory) {
         return countItemsMatching(inventory, item -> {
             String path = itemId(item).getPath();
@@ -2444,6 +2648,31 @@ public class FunctionCallerV2 {
             bot.drop(stack, false);
         }
         return true;
+    }
+
+    private static boolean addRecoveredOreDropDirectly(ServerPlayer bot, BlockState minedOreState) {
+        Item recoveredItem = recoveredDropForOre(minedOreState);
+        if (recoveredItem == Items.AIR) {
+            return false;
+        }
+
+        ItemStack stack = new ItemStack(recoveredItem, 1);
+        boolean added = bot.getInventory().add(stack);
+        bot.getInventory().setChanged();
+        if (!added && !stack.isEmpty()) {
+            bot.drop(stack, false);
+        }
+        return true;
+    }
+
+    private static Item recoveredDropForOre(BlockState minedOreState) {
+        if (minedOreState.is(Blocks.IRON_ORE) || minedOreState.is(Blocks.DEEPSLATE_IRON_ORE)) {
+            return Items.RAW_IRON;
+        }
+        if (minedOreState.is(Blocks.COAL_ORE) || minedOreState.is(Blocks.DEEPSLATE_COAL_ORE)) {
+            return Items.COAL;
+        }
+        return Items.AIR;
     }
 
     private static boolean hasItemByPath(Inventory inventory, String path) {

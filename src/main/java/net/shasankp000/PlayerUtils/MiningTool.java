@@ -45,6 +45,14 @@ public class MiningTool {
                 // Step 2: Select best tool
                 BlockState blockState = bot.level().getBlockState(targetBlockPos);
                 ItemStack bestTool = ToolSelector.selectBestToolForBlock(bot, blockState);
+                if (bestTool.isEmpty()) {
+                    if (blockState.requiresCorrectToolForDrops()) {
+                        miningResult.complete("❌ No usable tool for " + blockState.getBlock().getName().getString() + " at " + targetBlockPos);
+                        miningExecutor.shutdownNow();
+                        return miningResult;
+                    }
+                    bestTool = bot.getMainHandItem();
+                }
 
                 // Step 3: Switch to that tool
                 switchToTool(bot, bestTool);
@@ -215,8 +223,29 @@ public class MiningTool {
         for (int i = 0; i < 9; i++) {
             if (bot.getInventory().getItem(i) == tool) {
                 bot.getInventory().setSelectedSlot(i);
-                break;
+                return;
             }
+        }
+
+        for (int i = 9; i < bot.getInventory().getContainerSize(); i++) {
+            if (bot.getInventory().getItem(i) != tool) {
+                continue;
+            }
+
+            int hotbarSlot = 8;
+            for (int hotbar = 0; hotbar < 9; hotbar++) {
+                if (bot.getInventory().getItem(hotbar).isEmpty()) {
+                    hotbarSlot = hotbar;
+                    break;
+                }
+            }
+
+            ItemStack stackToMove = bot.getInventory().getItem(i);
+            bot.getInventory().setItem(hotbarSlot, stackToMove.copy());
+            bot.getInventory().setItem(i, ItemStack.EMPTY);
+            bot.getInventory().setSelectedSlot(hotbarSlot);
+            bot.getInventory().setChanged();
+            return;
         }
     }
 
