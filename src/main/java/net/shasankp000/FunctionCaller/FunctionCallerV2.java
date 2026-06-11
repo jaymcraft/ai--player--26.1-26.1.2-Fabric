@@ -95,6 +95,7 @@ public class FunctionCallerV2 {
 
     private static final String DB_URL = "jdbc:sqlite:" + "./sqlite_databases/" + "memory_agent.db";
     private static final int DRAGON_SPEEDRUN_REQUIRED_IRON = 7;
+    private static final int DRAGON_SPEEDRUN_MIN_PORTAL_IRON = 5;
     private static final int DRAGON_SPEEDRUN_REQUIRED_COAL = 2;
 
     private static final String host = "http://localhost:11434/";
@@ -1482,6 +1483,8 @@ public class FunctionCallerV2 {
 
     private static void clearDragonSpeedrunState() {
         sharedState.put("dragonSpeedrun.active", false);
+        sharedState.remove("dragonSpeedrun.coalPrepComplete");
+        sharedState.remove("dragonSpeedrun.ironPrepComplete");
         dragonSpeedrunHeartbeatMs = 0L;
         dragonSpeedrunFuture = null;
     }
@@ -1593,27 +1596,60 @@ public class FunctionCallerV2 {
 
     private static String executeStoneToolsStage(ServerPlayer bot, Inventory inventory) throws Exception {
         int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
-        if (cobble < 11) {
+        int neededCobble = 0;
+        if (!hasItemByPath(inventory, "stone_pickaxe")) {
+            neededCobble += 3;
+        }
+        if (!hasItemByPath(inventory, "stone_sword")) {
+            neededCobble += 2;
+        }
+        if (!hasItemByPath(inventory, "furnace")) {
+            neededCobble += 8;
+        }
+
+        if (cobble < neededCobble) {
             String pickaxeResult = ensureUsablePickaxeForStone(bot, inventory);
             if (!pickaxeResult.equals("OK")) {
                 return pickaxeResult;
             }
             String searchResult = searchMoveAndMineFirst(bot, List.of("minecraft:stone", "minecraft:cobblestone", "minecraft:deepslate"), "stone");
             if (searchResult.startsWith("WAIT:")) {
-                return mineDownForStone(bot, inventory, 11 - cobble);
+                return mineDownForStone(bot, inventory, neededCobble - cobble);
             }
             return searchResult;
         }
         if (!hasItemByPath(inventory, "stone_pickaxe")) {
+            if (countItemByPath(inventory, "stick") < 2) {
+                return ensureSticksForStoneTools(bot, inventory, 2);
+            }
             return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
         }
         if (!hasItemByPath(inventory, "stone_sword")) {
+            if (countItemByPath(inventory, "stick") < 1) {
+                return ensureSticksForStoneTools(bot, inventory, 1);
+            }
             return craftItemOnServerThreadSync(bot, "stone_sword", 1);
         }
         if (!hasItemByPath(inventory, "furnace")) {
             return craftItemOnServerThreadSync(bot, "furnace", 1);
         }
         return "Stone tools complete.";
+    }
+
+    private static String ensureSticksForStoneTools(ServerPlayer bot, Inventory inventory, int requiredSticks) throws Exception {
+        if (countItemByPath(inventory, "stick") >= requiredSticks) {
+            return "OK";
+        }
+
+        int planks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks"));
+        int logs = countWoodItems(inventory);
+        if (planks < 2 && logs > 0) {
+            return craftAvailablePlanks(bot, inventory, 1);
+        }
+        if (planks >= 2) {
+            return craftItemOnServerThreadSync(bot, "stick", 1);
+        }
+        return searchMoveAndMineWood(bot, inventory);
     }
 
     private static String executeIronRouteStage(ServerPlayer bot, Inventory inventory) throws Exception {
@@ -1625,10 +1661,12 @@ public class FunctionCallerV2 {
                 || hasItemByPath(inventory, "water_bucket")
                 || hasItemByPath(inventory, "lava_bucket");
         boolean hasIronPickaxe = hasItemByPath(inventory, "iron_pickaxe");
+        boolean coalPrepComplete = isDragonSpeedrunCoalPrepComplete(inventory);
+        boolean ironPrepComplete = isDragonSpeedrunIronPrepComplete(inventory);
         List<String> ironOreTypes = List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore");
         List<String> coalOreTypes = List.of("minecraft:coal_ore", "minecraft:deepslate_coal_ore");
 
-        if (ironProgress < DRAGON_SPEEDRUN_REQUIRED_IRON) {
+        if (!ironPrepComplete) {
             String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
             if (!pickaxeResult.equals("OK")) {
                 return pickaxeResult;
@@ -1638,10 +1676,15 @@ public class FunctionCallerV2 {
             if (!exposedResult.startsWith("WAIT:")) {
                 return exposedResult;
             }
-            return tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
+            String tunnelResult = tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
+            if (tunnelResult.startsWith("WAIT:") && ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON) {
+                sharedState.put("dragonSpeedrun.ironPrepComplete", true);
+                return "Accepting " + ironProgress + " iron progress for portal prep because no reachable extra iron was found.";
+            }
+            return tunnelResult;
         }
 
-        if (coal < DRAGON_SPEEDRUN_REQUIRED_COAL) {
+        if (!coalPrepComplete && coal < DRAGON_SPEEDRUN_REQUIRED_COAL) {
             String pickaxeResult = ensureUsablePickaxeForCoalOre(bot, inventory);
             if (!pickaxeResult.equals("OK")) {
                 return pickaxeResult;
@@ -1652,6 +1695,9 @@ public class FunctionCallerV2 {
                 return exposedCoalResult;
             }
             return tunnelToAndMineCoal(bot, coalOreTypes);
+        }
+        if (coal >= DRAGON_SPEEDRUN_REQUIRED_COAL) {
+            sharedState.put("dragonSpeedrun.coalPrepComplete", true);
         }
 
         if (rawIron > 0) {
@@ -1680,8 +1726,16 @@ public class FunctionCallerV2 {
             return craftItemOnServerThreadSync(bot, "bucket", 1);
         }
 
-        if (!hasIronPickaxe && ironIngots >= 3) {
+        if (!hasIronPickaxe && ironIngots >= 3 && ironProgress >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
             return craftItemOnServerThreadSync(bot, "iron_pickaxe", 1);
+        }
+
+        if (hasBucket && (hasIronPickaxe || ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON)) {
+            sharedState.put("dragonSpeedrun.ironPrepComplete", true);
+            sharedState.put("dragonSpeedrun.coalPrepComplete", true);
+            return hasIronPickaxe
+                    ? "Iron route complete: bucket, iron pickaxe, and coal prep are ready for portal prep."
+                    : "Iron route complete: bucket and coal prep are ready for portal prep.";
         }
 
         String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
@@ -1974,6 +2028,12 @@ public class FunctionCallerV2 {
             }
 
             boolean isStone = isAnyBlockType(world, below, stoneBlocks);
+            if (belowState.requiresCorrectToolForDrops()) {
+                String pickaxeResult = ensureUsablePickaxeForStone(bot, inventory);
+                if (!pickaxeResult.equals("OK")) {
+                    return pickaxeResult;
+                }
+            }
             lastMineResult = MiningTool.mineBlock(bot, below).get(15, TimeUnit.SECONDS);
             if (lastMineResult.startsWith("❌") || lastMineResult.startsWith("⚠️")) {
                 return "WAIT:I tried digging down for stone, but couldn't mine the block below me: " + lastMineResult;
@@ -2800,6 +2860,8 @@ public class FunctionCallerV2 {
         int rawIron = countItemByPath(inventory, "raw_iron");
         int coal = countItemByPath(inventory, "coal");
         int ironProgress = countDragonSpeedrunIronProgress(inventory);
+        boolean coalPrepComplete = isDragonSpeedrunCoalPrepComplete(inventory);
+        boolean ironPrepComplete = isDragonSpeedrunIronPrepComplete(inventory);
         int blazeRods = countItemByPath(inventory, "blaze_rod");
         int enderPearls = countItemByPath(inventory, "ender_pearl");
         int eyes = countItemByPath(inventory, "ender_eye");
@@ -2814,6 +2876,7 @@ public class FunctionCallerV2 {
         boolean hasWoodPickaxe = hasUsableItemByPath(inventory, "wooden_pickaxe");
         boolean hasStonePickaxe = hasUsableItemByPath(inventory, "stone_pickaxe");
         boolean hasIronPickaxe = hasUsableItemByPath(inventory, "iron_pickaxe");
+        boolean hasFurnace = hasItemByPath(inventory, "furnace");
         boolean hasWeapon = hasItemByPath(inventory, "stone_sword")
                 || hasItemByPath(inventory, "iron_sword")
                 || hasItemByPath(inventory, "diamond_sword")
@@ -2826,30 +2889,32 @@ public class FunctionCallerV2 {
         boolean hasWater = hasItemByPath(inventory, "water_bucket");
         boolean hasLava = hasItemByPath(inventory, "lava_bucket");
         boolean hasBow = hasItemByPath(inventory, "bow") || hasItemByPath(inventory, "crossbow");
+        boolean hasAnyPickaxe = hasWoodPickaxe || hasStonePickaxe || hasIronPickaxe;
 
         DragonSpeedrunStage stage;
-        if (logs + planks < 8 || sticks < 4 || !hasCraftingTable || !hasWoodPickaxe) {
+        if (!hasCraftingTable || !hasAnyPickaxe || ((logs + planks < 8 || sticks < 4) && !hasAnyPickaxe)) {
             stage = new DragonSpeedrunStage(
                     "Overworld setup",
                     "Collect logs, craft planks/sticks/crafting table, then craft a wooden pickaxe.",
                     "Need about 8 wood/planks, 4 sticks, crafting table, wooden pickaxe."
             );
-        } else if (!hasStonePickaxe || cobble < 8) {
+        } else if ((!hasStonePickaxe && !hasIronPickaxe) || !hasFurnace) {
             stage = new DragonSpeedrunStage(
                     "Stone tools",
                     "Mine cobblestone and craft a stone pickaxe, stone axe or sword, and furnace if needed.",
                     "Need stone pickaxe and extra cobblestone."
             );
         } else if (rawIron > 0
-                || ironProgress < DRAGON_SPEEDRUN_REQUIRED_IRON
-                || coal < DRAGON_SPEEDRUN_REQUIRED_COAL
-                || !hasIronPickaxe
+                || !ironPrepComplete
+                || !coalPrepComplete
+                || (!hasIronPickaxe && ironProgress >= DRAGON_SPEEDRUN_REQUIRED_IRON)
                 || !hasBucket) {
             stage = new DragonSpeedrunStage(
                     "Iron route",
                     "Mine 7 raw iron and 2 coal, then smelt and craft bucket plus iron pickaxe before portal prep.",
                     "Need " + DRAGON_SPEEDRUN_REQUIRED_IRON + " iron progress and " + DRAGON_SPEEDRUN_REQUIRED_COAL
-                            + " coal. Current: " + ironProgress + " iron progress, " + coal + " coal."
+                            + " coal mined/prepped. Current: " + ironProgress + " iron progress, ironPrepComplete="
+                            + ironPrepComplete + ", " + coal + " coal, coalPrepComplete=" + coalPrepComplete + "."
             );
         } else if (!hasBucket || (!hasWater && !hasLava)) {
             stage = new DragonSpeedrunStage(
@@ -2920,6 +2985,18 @@ public class FunctionCallerV2 {
                 || hasUsableItemByPath(inventory, "iron_pickaxe")) {
             return "OK";
         }
+        if (countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate") >= 3) {
+            if (countItemByPath(inventory, "stick") < 2) {
+                return ensureSticksForStoneTools(bot, inventory, 2);
+            }
+            return craftItemOnServerThreadSync(bot, "stone_pickaxe", 1);
+        }
+        if (countItemByPath(inventory, "stick") < 2) {
+            String stickResult = ensureSticksForStoneTools(bot, inventory, 2);
+            if (!stickResult.equals("OK")) {
+                return stickResult;
+            }
+        }
         return craftItemOnServerThreadSync(bot, "wooden_pickaxe", 1);
     }
 
@@ -2977,6 +3054,43 @@ public class FunctionCallerV2 {
             progress += 1;
         }
         return progress;
+    }
+
+    private static boolean isDragonSpeedrunIronPrepComplete(Inventory inventory) {
+        if (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.ironPrepComplete"))) {
+            return true;
+        }
+        int ironProgress = countDragonSpeedrunIronProgress(inventory);
+        if (ironProgress >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
+            sharedState.put("dragonSpeedrun.ironPrepComplete", true);
+            return true;
+        }
+        boolean hasBucket = hasItemByPath(inventory, "bucket")
+                || hasItemByPath(inventory, "water_bucket")
+                || hasItemByPath(inventory, "lava_bucket");
+        if (hasBucket && ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON) {
+            sharedState.put("dragonSpeedrun.ironPrepComplete", true);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isDragonSpeedrunCoalPrepComplete(Inventory inventory) {
+        if (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.coalPrepComplete"))) {
+            return true;
+        }
+        if (countItemByPath(inventory, "coal") >= DRAGON_SPEEDRUN_REQUIRED_COAL) {
+            sharedState.put("dragonSpeedrun.coalPrepComplete", true);
+            return true;
+        }
+        boolean hasBucket = hasItemByPath(inventory, "bucket")
+                || hasItemByPath(inventory, "water_bucket")
+                || hasItemByPath(inventory, "lava_bucket");
+        if (hasBucket && hasItemByPath(inventory, "iron_pickaxe") && countDragonSpeedrunIronProgress(inventory) >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
+            sharedState.put("dragonSpeedrun.coalPrepComplete", true);
+            return true;
+        }
+        return false;
     }
 
     private static int countWoodItems(Inventory inventory) {

@@ -180,6 +180,9 @@ public class PathTracer {
 
             // Get the final destination for distance checking
             BlockPos finalDestination = getFinalDestination();
+            if (finalDestination == null) {
+                finalDestination = completedSegment.end();
+            }
 
             LOGGER.info("Bot at: {}, Target: {}, Final: {}", currentPos, completedSegment.end(), finalDestination);
 
