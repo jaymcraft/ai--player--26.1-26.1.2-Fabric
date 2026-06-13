@@ -95,8 +95,8 @@ public class FunctionCallerV2 {
 
     private static final String DB_URL = "jdbc:sqlite:" + "./sqlite_databases/" + "memory_agent.db";
     private static final int DRAGON_SPEEDRUN_REQUIRED_IRON = 7;
-    private static final int DRAGON_SPEEDRUN_MIN_PORTAL_IRON = 5;
     private static final int DRAGON_SPEEDRUN_REQUIRED_COAL = 2;
+    private static final int DRAGON_SPEEDRUN_MAX_ACTIONS = 1000;
 
     private static final String host = "http://localhost:11434/";
 
@@ -1498,7 +1498,7 @@ public class FunctionCallerV2 {
 
         int actions = 0;
         String lastResult = "Started Ender Dragon speedrun.";
-        while (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active")) && actions < 80) {
+        while (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active")) && actions < DRAGON_SPEEDRUN_MAX_ACTIONS) {
             dragonSpeedrunHeartbeatMs = System.currentTimeMillis();
             bot = botSource.getPlayer();
             if (bot == null) {
@@ -1538,6 +1538,14 @@ public class FunctionCallerV2 {
                 ChatUtils.sendChatMessages(botSource, lastResult);
                 break;
             }
+        }
+
+        if (actions >= DRAGON_SPEEDRUN_MAX_ACTIONS && Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.active"))) {
+            lastResult = "WAIT:I hit the speedrun action budget after " + actions
+                    + " actions. Current stage: "
+                    + sharedState.getOrDefault("dragonSpeedrun.stage", "unknown")
+                    + ". Say kill the ender dragon again and I will continue from inventory.";
+            ChatUtils.sendChatMessages(botSource, lastResult.substring("WAIT:".length()));
         }
 
         getFunctionOutput(lastResult);
@@ -1596,8 +1604,10 @@ public class FunctionCallerV2 {
 
     private static String executeStoneToolsStage(ServerPlayer bot, Inventory inventory) throws Exception {
         int cobble = countItemByPath(inventory, "cobblestone") + countItemByPath(inventory, "cobbled_deepslate");
+        boolean hasUsableStoneOrIronPickaxe = hasUsableItemByPath(inventory, "stone_pickaxe")
+                || hasUsableItemByPath(inventory, "iron_pickaxe");
         int neededCobble = 0;
-        if (!hasItemByPath(inventory, "stone_pickaxe")) {
+        if (!hasUsableStoneOrIronPickaxe) {
             neededCobble += 3;
         }
         if (!hasItemByPath(inventory, "stone_sword")) {
@@ -1618,7 +1628,7 @@ public class FunctionCallerV2 {
             }
             return searchResult;
         }
-        if (!hasItemByPath(inventory, "stone_pickaxe")) {
+        if (!hasUsableStoneOrIronPickaxe) {
             if (countItemByPath(inventory, "stick") < 2) {
                 return ensureSticksForStoneTools(bot, inventory, 2);
             }
@@ -1677,9 +1687,8 @@ public class FunctionCallerV2 {
                 return exposedResult;
             }
             String tunnelResult = tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
-            if (tunnelResult.startsWith("WAIT:") && ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON) {
-                sharedState.put("dragonSpeedrun.ironPrepComplete", true);
-                return "Accepting " + ironProgress + " iron progress for portal prep because no reachable extra iron was found.";
+            if (tunnelResult.startsWith("WAIT:")) {
+                return branchMineForIron(bot, inventory, ironOreTypes);
             }
             return tunnelResult;
         }
@@ -1723,19 +1732,25 @@ public class FunctionCallerV2 {
         }
 
         if (!hasBucket && ironIngots >= 3) {
+            String craftingBasicsResult = ensureDragonRouteCraftingBasics(bot, inventory, hasIronPickaxe ? 0 : 2);
+            if (!craftingBasicsResult.equals("OK")) {
+                return craftingBasicsResult;
+            }
             return craftItemOnServerThreadSync(bot, "bucket", 1);
         }
 
         if (!hasIronPickaxe && ironIngots >= 3 && ironProgress >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
+            String craftingBasicsResult = ensureDragonRouteCraftingBasics(bot, inventory, 2);
+            if (!craftingBasicsResult.equals("OK")) {
+                return craftingBasicsResult;
+            }
             return craftItemOnServerThreadSync(bot, "iron_pickaxe", 1);
         }
 
-        if (hasBucket && (hasIronPickaxe || ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON)) {
+        if (hasBucket && hasIronPickaxe) {
             sharedState.put("dragonSpeedrun.ironPrepComplete", true);
             sharedState.put("dragonSpeedrun.coalPrepComplete", true);
-            return hasIronPickaxe
-                    ? "Iron route complete: bucket, iron pickaxe, and coal prep are ready for portal prep."
-                    : "Iron route complete: bucket and coal prep are ready for portal prep.";
+            return "Iron route complete: bucket, iron pickaxe, and coal prep are ready for portal prep.";
         }
 
         String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
@@ -1752,6 +1767,26 @@ public class FunctionCallerV2 {
         }
 
         return tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
+    }
+
+    private static String ensureDragonRouteCraftingBasics(ServerPlayer bot, Inventory inventory, int requiredSticks) throws Exception {
+        if (!hasItemByPath(inventory, "crafting_table")) {
+            int planks = countItemsMatching(inventory, item -> itemId(item).getPath().endsWith("_planks"));
+            int logs = countWoodItems(inventory);
+            if (planks < 4 && logs > 0) {
+                return craftAvailablePlanks(bot, inventory, 1);
+            }
+            if (planks < 4) {
+                return searchMoveAndMineWood(bot, inventory);
+            }
+            return craftItemOnServerThreadSync(bot, "crafting_table", 1);
+        }
+
+        if (requiredSticks > 0 && countItemByPath(inventory, "stick") < requiredSticks) {
+            return ensureSticksForStoneTools(bot, inventory, requiredSticks);
+        }
+
+        return "OK";
     }
 
     private static String executePortalPrepStage(ServerPlayer bot, Inventory inventory) throws Exception {
@@ -1884,6 +1919,61 @@ public class FunctionCallerV2 {
         }
 
         return "WAIT:I found " + label + ", but couldn't mine a safe tunnel to it yet.";
+    }
+
+    private static String branchMineForIron(ServerPlayer bot, Inventory inventory, List<String> ironOreTypes) throws Exception {
+        ServerLevel world = (ServerLevel) bot.level();
+        Direction forward = Direction.fromYRot(bot.getYRot());
+        String lastMineResult = "No branch tunnel block mined yet.";
+        int minedBlocks = 0;
+
+        for (int step = 1; step <= 10; step++) {
+            String pickaxeResult = ensureUsablePickaxeForIronOre(bot, inventory);
+            if (!pickaxeResult.equals("OK")) {
+                return pickaxeResult;
+            }
+
+            BlockPos feet = bot.blockPosition();
+            BlockPos nextFeet = feet.relative(forward);
+            if (nextFeet.getY() <= world.getMinY() + 1) {
+                return "WAIT:I need more iron, but this branch tunnel is too deep to continue safely.";
+            }
+
+            for (BlockPos clearPos : List.of(nextFeet, nextFeet.above())) {
+                BlockState clearState = world.getBlockState(clearPos);
+                if (clearState.isAir() || clearState.canBeReplaced()) {
+                    continue;
+                }
+                if (!clearState.getFluidState().isEmpty()) {
+                    return "WAIT:I need more iron, but branch mining hit fluid at " + clearPos + ".";
+                }
+                lastMineResult = MiningTool.mineBlock(bot, clearPos).get(20, TimeUnit.SECONDS);
+                if (lastMineResult.startsWith("❌") || lastMineResult.startsWith("⚠️")) {
+                    return "WAIT:I need more iron, but couldn't continue branch mining: " + lastMineResult;
+                }
+                minedBlocks++;
+                Thread.sleep(200L);
+            }
+
+            BlockState floorState = world.getBlockState(nextFeet.below());
+            if (floorState.isAir() || !floorState.getFluidState().isEmpty()) {
+                return "WAIT:I need more iron, but the branch tunnel floor is unsafe at " + nextFeet.below() + ".";
+            }
+
+            String moveResult = startPreciseCoordinateMove(nextFeet.getX(), nextFeet.getY(), nextFeet.getZ(), false, false).get(20, TimeUnit.SECONDS);
+            if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
+                return "WAIT:I need more iron, but couldn't move through the branch tunnel: " + moveResult;
+            }
+
+            List<BlockPos> exposedIron = findNearestBlocks(bot, ironOreTypes, 8, 8, 8);
+            if (!exposedIron.isEmpty()) {
+                return tunnelToAndMineOre(bot, inventory, ironOreTypes, "iron ore");
+            }
+        }
+
+        return "Branch-mined while searching for more iron. Cleared " + minedBlocks
+                + " tunnel blocks; still need " + DRAGON_SPEEDRUN_REQUIRED_IRON
+                + " iron progress. Last mining result: " + lastMineResult;
     }
 
     private static String tunnelToAndMineCoal(ServerPlayer bot, List<String> coalOreTypes) throws Exception {
@@ -2212,8 +2302,8 @@ public class FunctionCallerV2 {
                 }
                 mined++;
                 minedLogPositions.add(treeLog);
-                Thread.sleep(250L);
-                collectNearbyDroppedItems(bot, logTypes, treeLog, 5.0);
+                Thread.sleep(75L);
+                collectNearbyDroppedItemsFast(bot, logTypes, treeLog, 5.0);
                 int currentLogs = countWoodItems(inventory);
                 if (currentLogs <= logsBeforeMine && addMinedLogDirectly(bot, minedLogState)) {
                     currentLogs = countWoodItems(inventory);
@@ -2222,15 +2312,17 @@ public class FunctionCallerV2 {
                 if (currentLogs - beforeLogs >= neededWoodUnits) {
                     break;
                 }
-                Thread.sleep(150L);
+                Thread.sleep(50L);
             }
         }
 
-        collectNearbyDroppedItems(bot, logTypes, bot.blockPosition(), 8.0);
-        for (BlockPos minedLogPos : minedLogPositions) {
-            collectNearbyDroppedItems(bot, logTypes, minedLogPos, 5.0);
+        if (countWoodItems(inventory) - beforeLogs < neededWoodUnits) {
+            collectNearbyDroppedItemsFast(bot, logTypes, bot.blockPosition(), 8.0);
+            for (BlockPos minedLogPos : minedLogPositions) {
+                collectNearbyDroppedItemsFast(bot, logTypes, minedLogPos, 5.0);
+            }
+            Thread.sleep(75L);
         }
-        Thread.sleep(250L);
         int afterLogs = countWoodItems(inventory);
         int gainedLogs = Math.max(0, afterLogs - beforeLogs);
         if (mined > 0) {
@@ -2238,6 +2330,57 @@ public class FunctionCallerV2 {
         }
 
         return "WAIT:I found trees, but couldn't reach a visible log to mine yet.";
+    }
+
+    private static void collectNearbyDroppedItemsFast(ServerPlayer bot, List<String> itemTypes, BlockPos origin, double radius) throws Exception {
+        ServerLevel world = (ServerLevel) bot.level();
+        AABB searchBox = new AABB(
+                origin.getX() - radius,
+                origin.getY() - 2.0,
+                origin.getZ() - radius,
+                origin.getX() + radius,
+                origin.getY() + 4.0,
+                origin.getZ() + radius
+        );
+        List<ItemEntity> droppedItems = world.getEntitiesOfClass(ItemEntity.class, searchBox, itemEntity -> {
+            Identifier itemId = BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem());
+            for (String itemType : itemTypes) {
+                Identifier expectedId = Identifier.tryParse(itemType.contains(":") ? itemType : "minecraft:" + itemType);
+                if (expectedId != null && expectedId.equals(itemId)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        droppedItems.sort(Comparator.comparingDouble(itemEntity -> itemEntity.distanceToSqr(bot)));
+        for (ItemEntity droppedItem : droppedItems) {
+            if (!droppedItem.isAlive()) {
+                continue;
+            }
+
+            BlockPos itemPos = droppedItem.blockPosition();
+            if (droppedItem.distanceToSqr(bot) <= 4.0) {
+                triggerNearbyItemPickupSync(bot, itemTypes, itemPos, 2.0);
+                continue;
+            }
+
+            BlockPos standPos = findStandablePickupPosition(bot, itemPos);
+            if (standPos.equals(bot.blockPosition()) && droppedItem.distanceToSqr(bot) > 6.25) {
+                continue;
+            }
+
+            String moveResult;
+            try {
+                moveResult = startPreciseCoordinateMove(standPos.getX(), standPos.getY(), standPos.getZ(), false, false).get(2, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                PathTracer.flushAllMovementTasks();
+                continue;
+            }
+            if (!moveResult.startsWith("❌") && !moveResult.startsWith("⚠️")) {
+                triggerNearbyItemPickupSync(bot, itemTypes, itemPos, 2.0);
+            }
+        }
     }
 
     private static void collectNearbyDroppedItems(ServerPlayer bot, List<String> itemTypes, BlockPos origin, double radius) throws Exception {
@@ -2423,7 +2566,7 @@ public class FunctionCallerV2 {
         }
 
         for (BlockPos sourcePos : candidates) {
-            String moveResult = moveToInteractionPosition(bot, sourcePos);
+            String moveResult = moveToFluidInteractionPosition(bot, sourcePos);
             if (moveResult.startsWith("❌") || moveResult.startsWith("⚠️")) {
                 logger.info("Could not reach {} source at {} via {}", label, sourcePos, moveResult);
                 continue;
@@ -2437,6 +2580,40 @@ public class FunctionCallerV2 {
         }
 
         return "WAIT:I found " + label + ", but couldn't reach or pick up a source block yet.";
+    }
+
+    private static String moveToFluidInteractionPosition(ServerPlayer bot, BlockPos targetPos) throws Exception {
+        List<BlockPos> candidates = findInteractionPositions(bot, targetPos);
+        if (candidates.isEmpty()) {
+            return "❌ No reachable fluid interaction position near " + targetPos;
+        }
+
+        String lastMoveResult = "❌ No fluid interaction move attempted";
+        for (BlockPos candidate : candidates) {
+            try {
+                lastMoveResult = startPreciseCoordinateMove(candidate.getX(), candidate.getY(), candidate.getZ(), true, false).get(10, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                lastMoveResult = "⚠️ Timed out moving to fluid interaction position " + candidate;
+                PathTracer.flushAllMovementTasks();
+                logger.warn("Timed out moving to fluid interaction position {} for target {}", candidate, targetPos);
+                continue;
+            }
+
+            if (isWithinInteractionRange(bot, targetPos) && canSeeBlock((ServerLevel) bot.level(), bot, targetPos)) {
+                return lastMoveResult;
+            }
+
+            String pathResult = GoTo.goTo(botSource, candidate.getX(), candidate.getY(), candidate.getZ(), true, 10);
+            if (!pathResult.startsWith("Failed")
+                    && !pathResult.startsWith("Error")
+                    && !pathResult.startsWith("⚠️")
+                    && isWithinInteractionRange(bot, targetPos)
+                    && canSeeBlock((ServerLevel) bot.level(), bot, targetPos)) {
+                return pathResult;
+            }
+            lastMoveResult = pathResult + " but fluid source is still out of bucket range.";
+        }
+        return lastMoveResult;
     }
 
     private static List<BlockPos> findNearestFluidSources(ServerPlayer bot, Block fluidBlock, int horizontalRadius, int verticalDown, int verticalUp) {
@@ -2622,7 +2799,7 @@ public class FunctionCallerV2 {
 
     private static String useItemOnBlockOnServerThread(ServerPlayer bot, BlockPos targetPos, Item requiredItem, Direction face, String label) {
         ServerLevel world = (ServerLevel) bot.level();
-        if (!isWithinPlacementRange(bot, targetPos)) {
+        if (!isWithinPlacementRange(bot, targetPos) && !isWithinInteractionRange(bot, targetPos)) {
             return "❌ Too far to use " + label + " at " + targetPos;
         }
 
@@ -2738,7 +2915,7 @@ public class FunctionCallerV2 {
                     eyePosition,
                     endInsideTarget,
                     net.minecraft.world.level.ClipContext.Block.COLLIDER,
-                    net.minecraft.world.level.ClipContext.Fluid.NONE,
+                    net.minecraft.world.level.ClipContext.Fluid.ANY,
                     bot
             ));
             if (lineOfSight.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK
@@ -2789,11 +2966,13 @@ public class FunctionCallerV2 {
             for (int radius = 1; radius <= 2; radius++) {
                 int x = targetPos.getX() + direction.getStepX() * radius;
                 int z = targetPos.getZ() + direction.getStepZ() * radius;
-                int y = findStandableBuilderY(world, x, z, targetPos.getY());
-                BlockPos candidate = new BlockPos(x, y, z);
-                Vec3 candidatePosition = new Vec3(x + 0.5, y, z + 0.5);
-                if (canBotOccupy(bot, candidatePosition, false) && Math.sqrt(targetPos.distToCenterSqr(candidatePosition)) <= 4.5) {
-                    candidates.add(candidate);
+                for (int yOffset = -6; yOffset <= 5; yOffset++) {
+                    int y = findStandableBuilderY(world, x, z, targetPos.getY() + yOffset);
+                    BlockPos candidate = new BlockPos(x, y, z);
+                    Vec3 candidatePosition = new Vec3(x + 0.5, y, z + 0.5);
+                    if (canBotOccupy(bot, candidatePosition, false) && canInteractWithBlockFromPosition(candidatePosition, targetPos)) {
+                        candidates.add(candidate);
+                    }
                 }
             }
         }
@@ -3068,7 +3247,7 @@ public class FunctionCallerV2 {
         boolean hasBucket = hasItemByPath(inventory, "bucket")
                 || hasItemByPath(inventory, "water_bucket")
                 || hasItemByPath(inventory, "lava_bucket");
-        if (hasBucket && ironProgress >= DRAGON_SPEEDRUN_MIN_PORTAL_IRON) {
+        if (hasBucket && hasItemByPath(inventory, "iron_pickaxe") && ironProgress >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
             sharedState.put("dragonSpeedrun.ironPrepComplete", true);
             return true;
         }
@@ -3077,6 +3256,11 @@ public class FunctionCallerV2 {
 
     private static boolean isDragonSpeedrunCoalPrepComplete(Inventory inventory) {
         if (Boolean.TRUE.equals(sharedState.get("dragonSpeedrun.coalPrepComplete"))) {
+            return true;
+        }
+        if (countItemByPath(inventory, "raw_iron") == 0
+                && countDragonSpeedrunIronProgress(inventory) >= DRAGON_SPEEDRUN_REQUIRED_IRON) {
+            sharedState.put("dragonSpeedrun.coalPrepComplete", true);
             return true;
         }
         if (countItemByPath(inventory, "coal") >= DRAGON_SPEEDRUN_REQUIRED_COAL) {
@@ -4504,6 +4688,26 @@ public class FunctionCallerV2 {
 
     private static boolean isWithinPlacementRange(ServerPlayer bot, BlockPos targetPos) {
         return Math.sqrt(targetPos.distToCenterSqr(bot.position())) <= 4.5;
+    }
+
+    private static boolean isWithinInteractionRange(ServerPlayer bot, BlockPos targetPos) {
+        return canInteractWithBlockFromPosition(bot.position(), targetPos);
+    }
+
+    private static boolean canInteractWithBlockFromPosition(Vec3 feetPosition, BlockPos targetPos) {
+        Vec3 eyePosition = feetPosition.add(0.0, 1.62, 0.0);
+        double maxDistanceSqr = 25.0;
+        for (Direction direction : Direction.values()) {
+            Vec3 faceCenter = Vec3.atCenterOf(targetPos).add(
+                    direction.getStepX() * 0.5,
+                    direction.getStepY() * 0.5,
+                    direction.getStepZ() * 0.5
+            );
+            if (eyePosition.distanceToSqr(faceCenter) <= maxDistanceSqr) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static BlockPos chooseBuilderPosition(ServerPlayer bot, BlockPos targetPos) {

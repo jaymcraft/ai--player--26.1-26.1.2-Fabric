@@ -20,6 +20,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class PathTracer {
     public static final Logger LOGGER = LoggerFactory.getLogger("ai-player");
@@ -29,12 +30,14 @@ public class PathTracer {
     private static Queue<Segment> segmentQueue = new LinkedList<>();
     private static boolean shouldSprint;
     private static final int MAX_RETRIES = 5; // Reduced from 10
+    private static final AtomicLong pathGeneration = new AtomicLong(0);
 
     public static class BotSegmentManager {
         private static final Queue<Segment> jobQueue = new LinkedList<>();
         private final MinecraftServer server;
         private static CommandSourceStack botSource = null;
         private final String botName;
+        private final long generation;
         private int retries = 0;
         private static boolean isMoving = false;
         private static Segment currentSegment = null; // Track current segment
@@ -48,12 +51,21 @@ public class PathTracer {
         }
 
         public BotSegmentManager(MinecraftServer server, CommandSourceStack botSource, String botName) {
+            this(server, botSource, botName, pathGeneration.incrementAndGet());
+            jobQueue.clear();
+            currentSegment = null;
+            isMoving = false;
+        }
+
+        private BotSegmentManager(MinecraftServer server, CommandSourceStack botSource, String botName, long generation) {
             this.server = server;
             BotSegmentManager.botSource = botSource;
             this.botName = botName;
+            this.generation = generation;
         }
 
         public static void clearJobs() {
+            pathGeneration.incrementAndGet();
             jobQueue.clear();
             isMoving = false;
             currentSegment = null;
@@ -81,6 +93,11 @@ public class PathTracer {
         }
 
         public void startProcessing() {
+            if (!isCurrentGeneration()) {
+                LOGGER.info("Ignoring stale path processing for {} generation {}", botName, generation);
+                return;
+            }
+
             // ✅ Initialize completion future if not already done
             if (pathCompletionFuture == null) {
                 pathCompletionFuture = new CompletableFuture<>();
@@ -115,6 +132,11 @@ public class PathTracer {
         }
 
         private void executeSegment(Segment segment) {
+            if (!isCurrentGeneration()) {
+                LOGGER.info("Ignoring stale segment for {} generation {}", botName, generation);
+                return;
+            }
+
             LOGGER.info("START segment: " + segment);
             updateFacing(segment);
 
@@ -126,7 +148,13 @@ public class PathTracer {
                 return;
             }
 
-            double speed = segment.sprint() ? SPRINTING_SPEED : WALKING_SPEED;
+            if (isVerticalOnlySegment(segment)) {
+                executeVerticalSegment(segment);
+                return;
+            }
+
+            boolean shortJumpSegment = segment.jump() && distance <= 2;
+            double speed = segment.sprint() && !shortJumpSegment ? SPRINTING_SPEED : WALKING_SPEED;
             double travelTime = roundTo2Decimals(distance / speed);
             long delayMillis = (long) (travelTime * 1000);
 
@@ -139,12 +167,15 @@ public class PathTracer {
             // Schedule jump if required, slightly before reaching the target to ensure proper timing
             if (segment.jump()) {
                 scheduler.schedule(() -> {
+                    if (!isCurrentGeneration()) {
+                        return;
+                    }
                     server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " jump");
                     LOGGER.info(botName + " performed a jump!");
                 }, jumpDelay, TimeUnit.MILLISECONDS); // Jump 200ms before reaching target
             }
 
-            if (segment.sprint()) {
+            if (segment.sprint() && !shortJumpSegment) {
                 server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " sprint");
             }
             else {
@@ -153,6 +184,9 @@ public class PathTracer {
             }
 
             scheduler.schedule(() -> {
+                if (!isCurrentGeneration()) {
+                    return;
+                }
                 modCommandRegistry.stopMoving(server, botSource, botName);
                 LOGGER.info(botName + " has stopped walking!");
             }, delayMillis, TimeUnit.MILLISECONDS);
@@ -163,7 +197,53 @@ public class PathTracer {
             scheduler.schedule(() -> waitForSegmentCompletion(segment), delayMillis + 100, TimeUnit.MILLISECONDS);
         }
 
+        private boolean isVerticalOnlySegment(Segment segment) {
+            return segment.start().getX() == segment.end().getX()
+                    && segment.start().getZ() == segment.end().getZ()
+                    && segment.start().getY() != segment.end().getY();
+        }
+
+        private void executeVerticalSegment(Segment segment) {
+            LOGGER.info("Using precise vertical correction for segment: {}", segment);
+            isMoving = true;
+            server.getCommands().performPrefixedCommand(botSource, "/player " + botName + " unsprint");
+            modCommandRegistry.stopMoving(server, botSource, botName);
+
+            scheduler.schedule(() -> {
+                if (!isCurrentGeneration()) {
+                    return;
+                }
+
+                ServerPlayer player = botSource.getPlayer();
+                if (player == null) {
+                    waitForSegmentCompletion(segment);
+                    return;
+                }
+
+                Vec3 target = new Vec3(segment.end().getX() + 0.5, segment.end().getY(), segment.end().getZ() + 0.5);
+                try {
+                    if (teleportIfCanOccupy(player, target)
+                            && hasReachedTarget(player.blockPosition(), segment.end(), segment)) {
+                        LOGGER.info("✅ Reached vertical segment target: {}", segment.end());
+                        retries = 0;
+                        isMoving = false;
+                        startProcessing();
+                        return;
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("Precise vertical segment correction failed for {}", segment, e);
+                }
+
+                waitForSegmentCompletion(segment);
+            }, 50, TimeUnit.MILLISECONDS);
+        }
+
         private void waitForSegmentCompletion(Segment completedSegment) {
+            if (!isCurrentGeneration()) {
+                LOGGER.info("Ignoring stale segment completion for {} generation {}", botName, generation);
+                return;
+            }
+
             ServerPlayer player = botSource.getPlayer();
             if (player == null) {
                 LOGGER.error("Player is null, cannot continue pathfinding");
@@ -251,8 +331,9 @@ public class PathTracer {
                     return;
                 }
 
-                // Clear old segments and create new ones
-                clearJobs();
+                // Replace pending segments without completing the public path future.
+                jobQueue.clear();
+                currentSegment = null;
                 segmentQueue.clear();
 
                 List<PathFinder.PathNode> simplified = PathFinder.simplifyPath(newPath, world);
@@ -302,12 +383,17 @@ public class PathTracer {
             for (int i = 0; i < remainingSegments.size(); i++) {
                 Segment segment = remainingSegments.get(i);
 
-                // Check if we're at this segment's start or end
-                if (isPositionMatch(currentPos, segment.start()) || isPositionMatch(currentPos, segment.end())) {
+                // Only skip forward when the bot has actually reached an upcoming
+                // segment end. Matching segment starts is too eager: standing near
+                // the beginning of a path can otherwise skip the whole route.
+                if (isAdvancedSegmentEndMatch(currentPos, segment.end())) {
                     LOGGER.info("✅ Bot advanced to segment {}: {}", i, segment);
 
-                    // Clear old segments up to this point
-                    clearJobs();
+                    // Clear old segments up to this point without completing the public path future.
+                    // clearJobs() reports "Path cleared", which makes callers think navigation is done
+                    // while the tracer is still processing the remaining path.
+                    jobQueue.clear();
+                    currentSegment = null;
 
                     // Add remaining segments starting from this one
                     for (int j = i; j < remainingSegments.size(); j++) {
@@ -322,10 +408,14 @@ public class PathTracer {
             return false;
         }
 
-        private boolean isPositionMatch(BlockPos pos1, BlockPos pos2) {
-            return Math.abs(pos1.getX() - pos2.getX()) <= 1 &&
-                    Math.abs(pos1.getY() - pos2.getY()) <= 1 &&
-                    Math.abs(pos1.getZ() - pos2.getZ()) <= 1;
+        private boolean isAdvancedSegmentEndMatch(BlockPos currentPos, BlockPos segmentEnd) {
+            return currentPos.getX() == segmentEnd.getX()
+                    && currentPos.getZ() == segmentEnd.getZ()
+                    && Math.abs(currentPos.getY() - segmentEnd.getY()) <= 1;
+        }
+
+        private boolean isCurrentGeneration() {
+            return generation == pathGeneration.get();
         }
 
         private boolean tryPreciseSegmentFallback(ServerPlayer player, Segment segment) throws Exception {
@@ -333,6 +423,10 @@ public class PathTracer {
             Vec3 target = new Vec3(segment.end().getX() + 0.5, segment.end().getY(), segment.end().getZ() + 0.5);
             if (start.distanceTo(target) > 4.0) {
                 return false;
+            }
+
+            if (start.distanceTo(target) <= 3.0 && teleportIfCanOccupy(player, target)) {
+                return hasReachedTarget(player.blockPosition(), segment.end(), segment);
             }
 
             int ticks = Math.max(1, (int) Math.ceil(start.distanceTo(target) * 6.0));
@@ -368,6 +462,29 @@ public class PathTracer {
             return hasReachedTarget(player.blockPosition(), segment.end(), segment);
         }
 
+        private boolean teleportIfCanOccupy(ServerPlayer player, Vec3 target) throws Exception {
+            CompletableFuture<Boolean> step = new CompletableFuture<>();
+            server.execute(() -> {
+                if (!canOccupy(player, target)) {
+                    step.complete(false);
+                    return;
+                }
+
+                player.teleportTo(
+                        player.level(),
+                        target.x,
+                        target.y,
+                        target.z,
+                        Set.of(),
+                        player.getYRot(),
+                        player.getXRot(),
+                        false
+                );
+                step.complete(true);
+            });
+            return step.get(1, TimeUnit.SECONDS);
+        }
+
         private boolean canOccupy(ServerPlayer player, Vec3 position) {
             ServerLevel world = (ServerLevel) player.level();
             BlockPos feet = BlockPos.containing(position.x, position.y, position.z);
@@ -384,9 +501,15 @@ public class PathTracer {
             );
             return !below.isAir()
                     && below.isRedstoneConductor(world, feet.below())
-                    && (body.isAir() || body.canBeReplaced())
-                    && (head.isAir() || head.canBeReplaced())
+                    && isPassableForPathCorrection(world, feet, body)
+                    && isPassableForPathCorrection(world, feet.above(), head)
                     && world.noCollision(player, hitbox);
+        }
+
+        private boolean isPassableForPathCorrection(ServerLevel world, BlockPos pos, BlockState state) {
+            return state.isAir()
+                    || state.canBeReplaced()
+                    || state.getCollisionShape(world, pos).isEmpty();
         }
 
         // ✅ Updated to return proper format for parsing
@@ -492,9 +615,10 @@ public class PathTracer {
 
         // Clear any existing completion future
         BotSegmentManager.clearJobs();
+        long generation = pathGeneration.get();
 
         // Create the manager and initialize the completion future FIRST
-        BotSegmentManager manager = new BotSegmentManager(server, botSource, botName);
+        BotSegmentManager manager = new BotSegmentManager(server, botSource, botName, generation);
         CompletableFuture<String> completionFuture = BotSegmentManager.getPathCompletionFuture();
 
         // Start the path execution in a separate thread

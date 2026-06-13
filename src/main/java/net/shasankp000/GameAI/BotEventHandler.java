@@ -581,6 +581,7 @@ public class BotEventHandler {
 
                     // Choose action
                     StateActions.Action chosenAction = rlAgentHook.chooseActionPlayMode(currentState, qTable, riskMap, "detectAndReactPlayMode", transitionHistory);
+                    chosenAction = applyHostileSurvivalOverride(bot, hostileEntities, chosenAction);
 
 
                     // Log chosen action for debugging
@@ -617,6 +618,38 @@ public class BotEventHandler {
                 AutoFaceEntity.isHandlerTriggered = false; // Reset the trigger flag
             }
         }
+    }
+
+    private static StateActions.Action applyHostileSurvivalOverride(ServerPlayer bot, List<Entity> hostileEntities, StateActions.Action chosenAction) {
+        if (chosenAction != StateActions.Action.STAY || hostileEntities == null || hostileEntities.isEmpty()) {
+            return chosenAction;
+        }
+
+        Entity closest = hostileEntities.stream()
+                .min(Comparator.comparingDouble(entity -> entity.distanceToSqr(bot)))
+                .orElse(null);
+        if (closest == null) {
+            return chosenAction;
+        }
+
+        double distance = Math.sqrt(closest.distanceToSqr(bot));
+        if (closest instanceof net.minecraft.world.entity.monster.Creeper && distance <= 6.0) {
+            System.out.println("STAY overridden: creeper too close, evading instead");
+            return StateActions.Action.EVADE;
+        }
+
+        Entity visibleTarget = HostileMobAttackTool.findBestVisibleHostileMob(bot);
+        if (visibleTarget != null && bot.position().distanceTo(visibleTarget.position()) <= HostileMobAttackTool.MELEE_ATTACK_REACH) {
+            System.out.println("STAY overridden: visible hostile in melee range, attacking instead");
+            return StateActions.Action.ATTACK;
+        }
+
+        if (distance <= 5.0) {
+            System.out.println("STAY overridden: hostile mob too close, evading instead");
+            return StateActions.Action.EVADE;
+        }
+
+        return chosenAction;
     }
 
     private static void executeAction(StateActions.Action chosenAction, CommandSourceStack botSource) {
